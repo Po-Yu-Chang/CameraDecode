@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage
+    x:Class="CameraMaui.MainPage"
+    xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+    xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+    xmlns:cv="clr-namespace:Camera.MAUI;assembly=Camera.MAUI"
+    Title="Ring Code Scanner"
+    BackgroundColor="#1a1a2e">
+
+    <ContentPage.Resources>
+        <Style x:Key="CardFrame" TargetType="Frame">
+            <Setter Property="BackgroundColor" Value="#16213e"/>
+            <Setter Property="BorderColor" Value="#0f3460"/>
+            <Setter Property="CornerRadius" Value="12"/>
+            <Setter Property="Padding" Value="12"/>
+            <Setter Property="HasShadow" Value="True"/>
+        </Style>
+        <Style x:Key="HeaderLabel" TargetType="Label">
+            <Setter Property="FontAttributes" Value="Bold"/>
+            <Setter Property="FontSize" Value="15"/>
+            <Setter Property="TextColor" Value="#e94560"/>
+        </Style>
+        <Style x:Key="ActionButton" TargetType="Button">
+            <Setter Property="CornerRadius" Value="8"/>
+            <Setter Property="FontAttributes" Value="Bold"/>
+            <Setter Property="HeightRequest" Value="40"/>
+            <Setter Property="FontSize" Value="12"/>
+        </Style>
+        <Style x:Key="ZoomButton" TargetType="Button">
+            <Setter Property="CornerRadius" Value="6"/>
+            <Setter Property="WidthRequest" Value="35"/>
+            <Setter Property="HeightRequest" Value="30"/>
+            <Setter Property="BackgroundColor" Value="#0f3460"/>
+            <Setter Property="TextColor" Value="White"/>
+            <Setter Property="FontAttributes" Value="Bold"/>
+            <Setter Property="Padding" Value="0"/>
+        </Style>
+        <Style x:Key="TabButton" TargetType="Button">
+            <Setter Property="CornerRadius" Value="8"/>
+            <Setter Property="HeightRequest" Value="36"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="FontAttributes" Value="Bold"/>
+            <Setter Property="Padding" Value="16,0"/>
+        </Style>
+    </ContentPage.Resources>
+
+    <Grid RowDefinitions="*,Auto,Auto" Padding="10">
+
+        <!-- Main: Tabbed Image Area -->
+        <Frame Grid.Row="0" Style="{StaticResource CardFrame}" Padding="0">
+            <Grid RowDefinitions="Auto,*">
+                <!-- Tab Header -->
+                <Grid ColumnDefinitions="Auto,Auto,*,Auto" BackgroundColor="#0f3460" Padding="8,4">
+                    <!-- Tab Buttons -->
+                    <Button x:Name="tabSource" Text="Source" Style="{StaticResource TabButton}"
+                            BackgroundColor="#e94560" TextColor="White" Clicked="OnTabSourceClicked" />
+                    <Button x:Name="tabResult" Text="Result" Style="{StaticResource TabButton}" Grid.Column="1"
+                            BackgroundColor="#16213e" TextColor="#888" Clicked="OnTabResultClicked" Margin="4,0,0,0" />
+
+                    <!-- Zoom Controls (right side) -->
+                    <HorizontalStackLayout Grid.Column="3" Spacing="4" VerticalOptions="Center">
+                        <Button Text="−" Style="{StaticResource ZoomButton}" Clicked="OnZoomOutClicked" />
+                        <Frame BackgroundColor="#1a1a2e" CornerRadius="6" Padding="6,3" HasShadow="False">
+                            <Label x:Name="lblZoom" Text="Fit" TextColor="#e94560" FontAttributes="Bold" FontSize="12" WidthRequest="40" HorizontalTextAlignment="Center" />
+                        </Frame>
+                        <Button Text="+" Style="{StaticResource ZoomButton}" Clicked="OnZoomInClicked" />
+                        <Button Text="⟲" Style="{StaticResource ZoomButton}" Clicked="OnZoomResetClicked" />
+                    </HorizontalStackLayout>
+                </Grid>
+
+                <!-- Tab Content -->
+                <Grid Grid.Row="1" BackgroundColor="#0a0a15" Margin="8">
+                    <!-- Source Image Tab -->
+                    <ScrollView x:Name="sourceScrollView" Orientation="Both" HorizontalOptions="Fill" VerticalOptions="Fill" IsVisible="True">
+                        <Image
+                            x:Name="sourceImage"
+                            Aspect="AspectFit"
+                            HorizontalOptions="Center"
+                            VerticalOptions="Center"
+                            BackgroundColor="Transparent" />
+                    </ScrollView>
+
+                    <!-- Result Image Tab -->
+                    <ScrollView x:Name="resultScrollView" Orientation="Both" HorizontalOptions="Fill" VerticalOptions="Fill" IsVisible="False">
+                        <Image
+                            x:Name="processedImage"
+                            Aspect="AspectFit"
+                            HorizontalOptions="Center"
+                            VerticalOptions="Center"
+                            BackgroundColor="Transparent" />
+                    </ScrollView>
+
+                    <!-- Empty State -->
+                    <VerticalStackLayout x:Name="emptyState" IsVisible="False" HorizontalOptions="Center" VerticalOptions="Center" Spacing="10">
+                        <Label Text="No image loaded" TextColor="#555" FontSize="16" HorizontalOptions="Center" />
+                        <Label Text="Use buttons below to load an image" TextColor="#444" FontSize="12" HorizontalOptions="Center" />
+                    </VerticalStackLayout>
+                </Grid>
+            </Grid>
+        </Frame>
+
+        <!-- Results Panel (compact) -->
+        <Frame Grid.Row="1" Style="{StaticResource CardFrame}" Margin="0,8,0,0" Padding="10">
+            <Grid ColumnDefinitions="*,Auto" RowDefinitions="Auto,Auto" ColumnSpacing="12" RowSpacing="4">
+                <!-- Left: Decode Results -->
+                <Grid ColumnDefinitions="Auto,*" RowDefinitions="Auto,Auto,Auto" ColumnSpacing="8" RowSpacing="3">
+                    <Label Text="Status:" TextColor="#888" FontSize="12" VerticalOptions="Center" />
+                    <Label x:Name="lblStatus" Text="Ready" TextColor="#4ecca3" FontSize="12" Grid.Column="1" VerticalOptions="Center" />
+
+                    <Label Text="Binary:" TextColor="#888" FontSize="12" Grid.Row="1" VerticalOptions="Center" />
+                    <Label x:Name="lblBinary" Text="-" TextColor="#7ec8e3" FontFamily="Consolas" FontSize="11" Grid.Row="1" Grid.Column="1" LineBreakMode="TailTruncation" VerticalOptions="Center" />
+
+                    <Label Text="Decoded:" TextColor="#888" FontSize="12" Grid.Row="2" VerticalOptions="Center" />
+                    <Label x:Name="lblDecoded" Text="-" TextColor="#e94560" FontSize="14" FontAttributes="Bold" Grid.Row="2" Grid.Column="1" VerticalOptions="Center" />
+                </Grid>
+
+                <!-- Right: Ring Count Badge -->
+                <Frame Grid.Column="1" BackgroundColor="#0f3460" CornerRadius="8" Padding="12,8" HasShadow="False" VerticalOptions="Center">
+                    <VerticalStackLayout Spacing="2">
+                        <Label x:Name="lblRingCount" Text="0" TextColor="#e94560" FontSize="24" FontAttributes="Bold" HorizontalOptions="Center" />
+                        <Label Text="Rings" TextColor="#888" FontSize="10" HorizontalOptions="Center" />
+                    </VerticalStackLayout>
+                </Frame>
+
+                <!-- Bottom: Details -->
+                <Label x:Name="lblDetails" Text="" TextColor="#666" FontSize="10" Grid.Row="1" Grid.ColumnSpan="2" />
+                <Label x:Name="MyLabel" Text="" TextColor="#555" FontSize="10" Grid.Row="1" Grid.Column="1" HorizontalTextAlignment="End" />
+            </Grid>
+        </Frame>
+
+        <!-- Bottom: Action Buttons -->
+        <Grid Grid.Row="2" ColumnDefinitions="*,*,*,*,*,*" ColumnSpacing="6" Padding="0,8,0,0">
+            <Button Grid.Column="0" Text="📸" Style="{StaticResource ActionButton}" BackgroundColor="#2196F3" TextColor="White" Clicked="OnCaptureClicked" x:Name="btnCapture" />
+            <Button Grid.Column="1" Text="📁" Style="{StaticResource ActionButton}" BackgroundColor="#4CAF50" TextColor="White" Clicked="OnSelectImageClicked" x:Name="btnSelectImage" />
+            <Button Grid.Column="2" Text="📂" Style="{StaticResource ActionButton}" BackgroundColor="#00BCD4" TextColor="White" Clicked="OnLoadPathClicked" x:Name="btnLoadPath" />
+            <Button Grid.Column="3" Text="🔍" Style="{StaticResource ActionButton}" BackgroundColor="#e94560" TextColor="White" Clicked="OnAnalyzeClicked" x:Name="btnAnalyze" FontSize="16" />
+            <Button Grid.Column="4" Text="🗑️" Style="{StaticResource ActionButton}" BackgroundColor="#555" TextColor="White" Clicked="OnClearClicked" x:Name="btnClear" />
+            <Button Grid.Column="5" Text="🎯" Style="{StaticResource ActionButton}" BackgroundColor="#9C27B0" TextColor="White" Clicked="OnTestWithSampleClicked" />
+        </Grid>
+
+        <!-- Hidden Camera View -->
+        <cv:CameraView x:Name="cameraView" CamerasLoaded="cameraView_CamerasLoaded" IsVisible="False" HeightRequest="0" />
+
+    </Grid>
+
+</ContentPage>

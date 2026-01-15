@@ -1173,22 +1173,26 @@ namespace CameraMaui.RingCode
                     double maxBranchArea = outerR * outerR * 0.06;  // Each branch < 6% of ring
                     if (c1.area > maxBranchArea || c2.area > maxBranchArea) continue;
 
-                    // Check angle difference (Y-shape branches are ~15-25° apart)
+                    // Check angle difference (Y-shape branches are ~15-22° apart)
+                    // STRICT: Narrower range to avoid false positives from adjacent data marks
                     double angleDiff = Math.Abs(c1.angle - c2.angle);
                     if (angleDiff > 180) angleDiff = 360 - angleDiff;
 
-                    if (angleDiff >= 12 && angleDiff <= 28)
+                    if (angleDiff >= 15 && angleDiff <= 24)
                     {
-                        // Check if both are at similar distance from center (within 0.22R)
+                        // Check if both are at similar distance from center (within 0.15R - STRICT)
+                        // Real Y-arrow branches are at SAME distance, data marks are scattered
                         double distDiff = Math.Abs(c1.centroidDistRatio - c2.centroidDistRatio);
-                        if (distDiff > 0.22) continue;
+                        if (distDiff > 0.15) continue;
 
-                        // BOTH branches must be in reasonable position (0.55-0.85R)
-                        if (c1.centroidDistRatio < 0.55 || c1.centroidDistRatio > 0.85) continue;
-                        if (c2.centroidDistRatio < 0.55 || c2.centroidDistRatio > 0.85) continue;
+                        // BOTH branches must be in inner-middle position (0.55-0.78R)
+                        // Data marks at outer ring (0.80R+) should NOT be matched as Y-pair
+                        if (c1.centroidDistRatio < 0.55 || c1.centroidDistRatio > 0.78) continue;
+                        if (c2.centroidDistRatio < 0.55 || c2.centroidDistRatio > 0.78) continue;
 
-                        // STRICT: If BOTH branches have very high solidity (>0.95), it's likely data marks
-                        if (c1.solidity > 0.95 && c2.solidity > 0.95) continue;
+                        // STRICT: If BOTH branches have high solidity (>0.92), it's likely data marks
+                        // Real arrow branches have lower solidity due to Y-shape gaps
+                        if (c1.solidity > 0.92 && c2.solidity > 0.92) continue;
 
                         double avgCentroidDist = (c1.centroidDistRatio + c2.centroidDistRatio) / 2;
 
@@ -1202,10 +1206,10 @@ namespace CameraMaui.RingCode
                         if (Math.Abs(c1.angle - c2.angle) > 180)
                             avgAngle = (avgAngle + 180) % 360;
 
-                        // Y-shape score
-                        double pairScore = 0.75;
-                        if (angleDiff >= 15 && angleDiff <= 22) pairScore += 0.15;
-                        if (avgCentroidDist >= 0.60 && avgCentroidDist <= 0.75) pairScore += 0.10;
+                        // Y-shape score - lower base score so shape-matched single contours can win
+                        double pairScore = 0.85;  // Lower to let shape match compete
+                        if (angleDiff >= 17 && angleDiff <= 21) pairScore += 0.08;  // Ideal angle ~18-20°
+                        if (avgCentroidDist >= 0.62 && avgCentroidDist <= 0.70) pairScore += 0.05;
 
                         // Use midpoint as base
                         var midBase = new PointF(
@@ -1342,6 +1346,64 @@ namespace CameraMaui.RingCode
             return directionScore * 0.10 + tipPositionScore * 0.15 +
                    centroidScore * 0.10 + combinedSolidityElongation * 0.55 +
                    areaScore * 0.10;
+        }
+
+        /// <summary>
+        /// Create a Y-shaped arrow template contour for shape matching
+        /// </summary>
+        private VectorOfPoint CreateArrowTemplate()
+        {
+            // Create Y-shaped arrow pointing RIGHT (0°)
+            // The Y-arrow has: stem pointing outward, two branches at the base
+            var points = new List<Point>
+            {
+                // Tip (outer point)
+                new Point(100, 50),
+                // Right branch
+                new Point(30, 20),
+                new Point(40, 35),
+                // Center junction
+                new Point(50, 50),
+                // Left branch
+                new Point(40, 65),
+                new Point(30, 80),
+            };
+
+            return new VectorOfPoint(points.ToArray());
+        }
+
+        /// <summary>
+        /// Calculate shape match score between a contour and the arrow template
+        /// Uses Hu Moments for rotation-invariant matching
+        /// </summary>
+        private double CalculateShapeMatchScore(VectorOfPoint contour, VectorOfPoint template)
+        {
+            try
+            {
+                // matchShapes returns 0 for perfect match, higher for worse match
+                // Use method I1 (Hu moments)
+                double matchValue = CvInvoke.MatchShapes(contour, template, ContoursMatchType.I1, 0);
+
+                // Convert to score (0-1 range, higher is better)
+                // matchValue < 0.1 = very good match
+                // matchValue > 1.0 = poor match
+                if (matchValue < 0.05)
+                    return 1.0;  // Excellent match
+                else if (matchValue < 0.1)
+                    return 0.9;
+                else if (matchValue < 0.2)
+                    return 0.7;
+                else if (matchValue < 0.3)
+                    return 0.5;
+                else if (matchValue < 0.5)
+                    return 0.3;
+                else
+                    return 0.1;  // Poor match
+            }
+            catch
+            {
+                return 0.0;
+            }
         }
 
         /// <summary>

@@ -15,10 +15,11 @@ class Program
 
         Directory.CreateDirectory(outputDir);
 
-        // Test 20 random images
-        var allFiles = Directory.GetFiles(testDir, "*.png");
-        var random = new Random(42);
-        var testFiles = allFiles.OrderBy(x => random.Next()).Take(20).ToArray();
+        // Create Y-arrow reference template for shape matching
+        var arrowTemplate = CreateArrowTemplate();
+
+        // Test all images
+        var testFiles = Directory.GetFiles(testDir, "*.png");
 
         Console.WriteLine($"Testing {testFiles.Length} images...\n");
 
@@ -31,7 +32,7 @@ class Program
             var original = new Image<Gray, byte>(testImagePath);
             Console.WriteLine($"Image size: {original.Width}x{original.Height}");
 
-            TestSingleImage(original, Path.Combine(outputDir, fileName), fileName);
+            TestSingleImage(original, Path.Combine(outputDir, fileName), fileName, arrowTemplate);
 
             original.Dispose();
         }
@@ -39,7 +40,7 @@ class Program
         Console.WriteLine("\n\n===== All tests completed =====");
     }
 
-    static void TestSingleImage(Image<Gray, byte> original, string outputPrefix, string fileName)
+    static void TestSingleImage(Image<Gray, byte> original, string outputPrefix, string fileName, VectorOfPoint arrowTemplate)
     {
         // Step 1: Find ring using simple method
         var (center, outerRadius, innerRadius) = FindRing(original);
@@ -48,8 +49,8 @@ class Program
         // Save preprocessing overlay for visual inspection
         SavePreprocessingOverlay(original, center, outerRadius, innerRadius, outputPrefix);
 
-        // Step 2: Test arrow detection
-        var arrowResult = TestArrowDetection(original, center, outerRadius, innerRadius, outputPrefix);
+        // Step 2: Test arrow detection with shape matching
+        var arrowResult = TestArrowDetection(original, center, outerRadius, innerRadius, outputPrefix, arrowTemplate);
         Console.WriteLine($"==> Result for {fileName}: arrow at {arrowResult:F1}°");
     }
 
@@ -257,7 +258,7 @@ class Program
         return (center, outerRadius, innerRadius);
     }
 
-    static double TestArrowDetection(Image<Gray, byte> original, PointF center, float outerR, float innerR, string outputPrefix)
+    static double TestArrowDetection(Image<Gray, byte> original, PointF center, float outerR, float innerR, string outputPrefix, VectorOfPoint arrowTemplate)
     {
         int cx = (int)center.X;
         int cy = (int)center.Y;
@@ -388,12 +389,99 @@ class Program
             // Calculate elongation ratio (tip-base distance vs area)
             double elongation = (maxTipDist - minBaseDist) / Math.Sqrt(area);
 
-            // Score calculation - prioritize arrow characteristics (low solidity, elongation)
-            double score = CalculateArrowScore(solidity, centroidDistRatio, tipDistRatio, area, outerR, tipPointsOutward, elongation);
+            // === CONVEXITY DEFECTS ANALYSIS for Y-shape detection ===
+            // Y-shaped arrow has significant concavity (defect) where the two branches meet
+            int significantDefects = 0;
+            double maxDefectDepth = 0;
+            try
+            {
+                // Get convex hull indices
+                using var hullIndices = new VectorOfInt();
+                CvInvoke.ConvexHull(contour, hullIndices, false, false);
+
+                if (hullIndices.Size >= 3)
+                {
+                    using var defects = new Mat();
+                    CvInvoke.ConvexityDefects(contour, hullIndices, defects);
+
+                    if (!defects.IsEmpty && defects.Rows > 0)
+                    {
+                        var defectData = new int[defects.Rows * 4];
+                        defects.CopyTo(defectData);
+
+                        for (int d = 0; d < defects.Rows; d++)
+                        {
+                            // defect: start_index, end_index, farthest_point_index, distance (fixpoint 8.8)
+                            double depth = defectData[d * 4 + 3] / 256.0;  // Convert from fixpoint
+
+                            // Significant defect if depth > 10% of contour size
+                            double minDepth = Math.Sqrt(area) * 0.15;
+                            if (depth > minDepth)
+                            {
+                                significantDefects++;
+                                if (depth > maxDefectDepth)
+                                    maxDefectDepth = depth;
+                            }
+                        }
+                    }
+                }
+            }
+            catch { /* Ignore defect errors */ }
+
+            // Y-shape arrow typically has 1-2 significant defects (the concave part of Y)
+            // Rectangular data marks have 0 defects (fully convex)
+            // Use defect depth RATIO - deeper defect relative to size = more Y-shaped
+            double defectRatio = maxDefectDepth / Math.Sqrt(area);
+
+            // === SHAPE MATCHING with Y-arrow template ===
+            double shapeMatchScore = CalculateShapeMatchScore(contour, arrowTemplate);
+
+            // Score calculation - SHAPE MATCHING IS PRIMARY
+            // If shape matches well, it's very likely the arrow
+            double baseScore = CalculateArrowScore(solidity, centroidDistRatio, tipDistRatio, area, outerR, tipPointsOutward, elongation);
+
+            // Combined score: shape match is weighted heavily
+            double score;
+            if (shapeMatchScore >= 0.7)
+            {
+                // Good shape match - trust it heavily
+                score = baseScore * 0.3 + shapeMatchScore * 0.7;
+            }
+            else if (shapeMatchScore >= 0.5)
+            {
+                // Medium shape match - balanced weighting
+                score = baseScore * 0.5 + shapeMatchScore * 0.5;
+            }
+            else
+            {
+                // Poor shape match - use base score but penalize
+                score = baseScore * 0.8;
+            }
+
+            // Bonus based on defect depth ratio (only if centroid is NOT at outer edge)
+            double defectBonus = 0;
+            if (centroidDistRatio < 0.85 && defectRatio >= 0.30)
+            {
+                defectBonus = Math.Min(0.15, defectRatio * 0.3);
+            }
+            score += defectBonus;
+
+            // PENALTY for very small contours - likely noise, not real arrow
+            // Real Y-arrow has area > 2000 typically (based on typical ring size ~330R)
+            double minExpectedArea = outerR * outerR * 0.02;  // ~2% of ring area (~2200 for R=330)
+            if (area < minExpectedArea && shapeMatchScore < 0.7)
+            {
+                double areaRatio = area / minExpectedArea;
+                double areaPenalty = 0.25 * (1.0 - areaRatio);
+                // Extra penalty for VERY small contours (< 50% of expected)
+                if (areaRatio < 0.5)
+                    areaPenalty += 0.15;
+                score -= areaPenalty;
+            }
 
             Console.WriteLine($"  Contour {i}: area={area:F0}, solidity={solidity:F3}, " +
                 $"centroid={centroidDistRatio:F2}R, tip={tipDistRatio:F2}R, angle={angle:F0}°, " +
-                $"elongation={elongation:F2}, score={score:F2}");
+                $"shapeMatch={shapeMatchScore:F2}, score={score:F2}");
 
             if (score > 0.1)
             {
@@ -429,23 +517,26 @@ class Program
                 double maxBranchArea = outerR * outerR * 0.06;  // Each branch < 6% of ring
                 if (c1.area > maxBranchArea || c2.area > maxBranchArea) continue;
 
-                // Check angle difference (Y-shape branches are ~15-25° apart)
+                // Check angle difference (Y-shape branches are ~15-22° apart)
+                // STRICT: Narrower range to avoid false positives from adjacent data marks
                 double angleDiff = Math.Abs(c1.angle - c2.angle);
                 if (angleDiff > 180) angleDiff = 360 - angleDiff;
 
-                if (angleDiff >= 12 && angleDiff <= 28)
+                if (angleDiff >= 15 && angleDiff <= 24)
                 {
-                    // Check if both are at similar distance from center (within 0.22R)
+                    // Check if both are at similar distance from center (within 0.15R - STRICT)
+                    // Real Y-arrow branches are at SAME distance, data marks are scattered
                     double distDiff = Math.Abs(c1.centroidDist - c2.centroidDist);
-                    if (distDiff > 0.22) continue;  // Branches must be at similar distance
+                    if (distDiff > 0.15) continue;  // Branches must be at very similar distance
 
-                    // BOTH branches must be in reasonable position (0.55-0.85R)
-                    if (c1.centroidDist < 0.55 || c1.centroidDist > 0.85) continue;
-                    if (c2.centroidDist < 0.55 || c2.centroidDist > 0.85) continue;
+                    // BOTH branches must be in inner-middle position (0.55-0.78R)
+                    // Data marks at outer ring (0.80R+) should NOT be matched as Y-pair
+                    if (c1.centroidDist < 0.55 || c1.centroidDist > 0.78) continue;
+                    if (c2.centroidDist < 0.55 || c2.centroidDist > 0.78) continue;
 
-                    // STRICT: If BOTH branches have very high solidity (>0.95), it's likely data marks
-                    // Real arrow branches have lower solidity due to Y-shape
-                    if (c1.solidity > 0.95 && c2.solidity > 0.95) continue;
+                    // STRICT: If BOTH branches have high solidity (>0.92), it's likely data marks
+                    // Real arrow branches have lower solidity due to Y-shape gaps
+                    if (c1.solidity > 0.92 && c2.solidity > 0.92) continue;
 
                     {
                         double avgCentroidDist = (c1.centroidDist + c2.centroidDist) / 2;
@@ -460,10 +551,10 @@ class Program
                         if (Math.Abs(c1.angle - c2.angle) > 180)
                             avgAngle = (avgAngle + 180) % 360;
 
-                        // Y-shape score
-                        double pairScore = 0.75;  // Base score for Y-shape pair
-                        if (angleDiff >= 15 && angleDiff <= 22) pairScore += 0.15;  // Ideal angle ~18°
-                        if (avgCentroidDist >= 0.60 && avgCentroidDist <= 0.75) pairScore += 0.10;
+                        // Y-shape score - lower base score so shape-matched single contours can win
+                        double pairScore = 0.85;  // Lower to let shape match compete
+                        if (angleDiff >= 17 && angleDiff <= 21) pairScore += 0.08;  // Ideal angle ~18-20°
+                        if (avgCentroidDist >= 0.62 && avgCentroidDist <= 0.70) pairScore += 0.05;
 
                         // Use midpoint as base
                         var midBase = new PointF(
@@ -480,16 +571,11 @@ class Program
             }
         }
 
-        // Only add Y-shape if no good single-contour arrow found
-        var bestSingleScore = allCandidates.Count > 0 ? allCandidates.Max(c => c.score) : 0;
+        // Always add Y-shape pairs - they have high reliability
         foreach (var yc in yShapeCandidates)
         {
-            // Only use Y-shape if it scores higher than best single contour
-            if (yc.score > bestSingleScore)
-            {
-                allCandidates.Add((yc.score, 0.5, yc.angle, yc.combinedArea, 0.7, 0.85,
-                    yc.contour1, yc.basePoint, "Y-Shape"));
-            }
+            allCandidates.Add((yc.score, 0.5, yc.angle, yc.combinedArea, 0.7, 0.85,
+                yc.contour1, yc.basePoint, "Y-Shape"));
         }
 
         // Sort and display results
@@ -869,5 +955,64 @@ class Program
         return directionScore * 0.10 + tipPositionScore * 0.15 +
                centroidScore * 0.10 + combinedSolidityElongation * 0.55 +
                areaScore * 0.10;
+    }
+
+    /// <summary>
+    /// Create a Y-shaped arrow template contour for shape matching
+    /// </summary>
+    static VectorOfPoint CreateArrowTemplate()
+    {
+        // Create Y-shaped arrow pointing RIGHT (0°)
+        // The Y-arrow has: stem pointing outward, two branches at the base
+        var points = new List<Point>
+        {
+            // Tip (outer point)
+            new Point(100, 50),
+            // Right branch
+            new Point(30, 20),
+            new Point(40, 35),
+            // Center junction
+            new Point(50, 50),
+            // Left branch
+            new Point(40, 65),
+            new Point(30, 80),
+            // Back to tip (close the shape)
+        };
+
+        return new VectorOfPoint(points.ToArray());
+    }
+
+    /// <summary>
+    /// Calculate shape match score between a contour and the arrow template
+    /// Uses Hu Moments for rotation-invariant matching
+    /// </summary>
+    static double CalculateShapeMatchScore(VectorOfPoint contour, VectorOfPoint template)
+    {
+        try
+        {
+            // matchShapes returns 0 for perfect match, higher for worse match
+            // Use method I1 (Hu moments)
+            double matchValue = CvInvoke.MatchShapes(contour, template, ContoursMatchType.I1, 0);
+
+            // Convert to score (0-1 range, higher is better)
+            // matchValue < 0.1 = very good match
+            // matchValue > 1.0 = poor match
+            if (matchValue < 0.05)
+                return 1.0;  // Excellent match
+            else if (matchValue < 0.1)
+                return 0.9;
+            else if (matchValue < 0.2)
+                return 0.7;
+            else if (matchValue < 0.3)
+                return 0.5;
+            else if (matchValue < 0.5)
+                return 0.3;
+            else
+                return 0.1;  // Poor match
+        }
+        catch
+        {
+            return 0.0;
+        }
     }
 }

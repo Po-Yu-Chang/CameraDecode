@@ -15,10 +15,10 @@ class Program
 
         Directory.CreateDirectory(outputDir);
 
-        // Test specific image
-        var testFiles = new[] {
-            Path.Combine(testDir, "20260100040000601.png")
-        };
+        // Test 20 random images
+        var allFiles = Directory.GetFiles(testDir, "*.png");
+        var random = new Random(42);
+        var testFiles = allFiles.OrderBy(x => random.Next()).Take(20).ToArray();
 
         Console.WriteLine($"Testing {testFiles.Length} images...\n");
 
@@ -304,11 +304,10 @@ class Program
         var maskedBinary = new Image<Gray, byte>(original.Size);
         CvInvoke.BitwiseAnd(binaryResult, dataMask, maskedBinary);
 
-        // Step 6: Morphological cleanup
+        // Step 6: Morphological cleanup (OPEN only - no CLOSE to preserve Y-shape)
         var kernel = CvInvoke.GetStructuringElement(ElementShape.Ellipse, new Size(3, 3), new Point(-1, -1));
         CvInvoke.MorphologyEx(maskedBinary, maskedBinary, MorphOp.Open, kernel, new Point(-1, -1), 1, BorderType.Default, new MCvScalar(0));
-        var largerKernel = CvInvoke.GetStructuringElement(ElementShape.Ellipse, new Size(5, 5), new Point(-1, -1));
-        CvInvoke.MorphologyEx(maskedBinary, maskedBinary, MorphOp.Close, largerKernel, new Point(-1, -1), 2, BorderType.Default, new MCvScalar(0));
+        // No CLOSE operation - preserve arrow Y-shape low solidity
 
         // Save preprocessed binary for arrow detection
         maskedBinary.Save(outputPrefix + "_arrow_binary.png");
@@ -401,6 +400,95 @@ class Program
                 var contourCopy = new VectorOfPoint(contour.ToArray());
                 allCandidates.Add((score, solidity, angle, area, centroidDistRatio, tipDistRatio,
                     contourCopy, basePoint, "Preprocessed"));
+            }
+        }
+
+        // === Y-SHAPE DETECTION: Find pairs of nearby contours ===
+        // Y-shaped arrow may be split into two branches - detect by finding adjacent pairs
+        // STRICT CONDITIONS to avoid false positives
+        Console.WriteLine($"\n=== Y-SHAPE PAIR DETECTION ===");
+        var yShapeCandidates = new List<(double score, double angle, double combinedArea,
+            VectorOfPoint contour1, VectorOfPoint contour2, PointF basePoint)>();
+
+        for (int i = 0; i < allCandidates.Count; i++)
+        {
+            for (int j = i + 1; j < allCandidates.Count; j++)
+            {
+                var c1 = allCandidates[i];
+                var c2 = allCandidates[j];
+
+                // Both contours must have reasonably HIGH solidity (individual branches are solid)
+                // Lower threshold to catch arrows with slightly filled branches
+                if (c1.solidity < 0.82 || c2.solidity < 0.82) continue;
+
+                // STRICT: Both should have similar area (arrow branches are symmetric)
+                double areaRatio = Math.Min(c1.area, c2.area) / Math.Max(c1.area, c2.area);
+                if (areaRatio < 0.4) continue;  // Branches should be similar size
+
+                // Both should be reasonably small (arrow branches are medium sized)
+                double maxBranchArea = outerR * outerR * 0.06;  // Each branch < 6% of ring
+                if (c1.area > maxBranchArea || c2.area > maxBranchArea) continue;
+
+                // Check angle difference (Y-shape branches are ~15-25° apart)
+                double angleDiff = Math.Abs(c1.angle - c2.angle);
+                if (angleDiff > 180) angleDiff = 360 - angleDiff;
+
+                if (angleDiff >= 12 && angleDiff <= 28)
+                {
+                    // Check if both are at similar distance from center (within 0.22R)
+                    double distDiff = Math.Abs(c1.centroidDist - c2.centroidDist);
+                    if (distDiff > 0.22) continue;  // Branches must be at similar distance
+
+                    // BOTH branches must be in reasonable position (0.55-0.85R)
+                    if (c1.centroidDist < 0.55 || c1.centroidDist > 0.85) continue;
+                    if (c2.centroidDist < 0.55 || c2.centroidDist > 0.85) continue;
+
+                    // STRICT: If BOTH branches have very high solidity (>0.95), it's likely data marks
+                    // Real arrow branches have lower solidity due to Y-shape
+                    if (c1.solidity > 0.95 && c2.solidity > 0.95) continue;
+
+                    {
+                        double avgCentroidDist = (c1.centroidDist + c2.centroidDist) / 2;
+
+                        // STRICT: Combined area should be reasonable for arrow
+                        double combinedArea = c1.area + c2.area;
+                        double expectedArea = outerR * outerR * 0.03;  // ~3% of ring area
+                        if (combinedArea < expectedArea * 0.3 || combinedArea > expectedArea * 3) continue;
+
+                        // Calculate average angle
+                        double avgAngle = (c1.angle + c2.angle) / 2;
+                        if (Math.Abs(c1.angle - c2.angle) > 180)
+                            avgAngle = (avgAngle + 180) % 360;
+
+                        // Y-shape score
+                        double pairScore = 0.75;  // Base score for Y-shape pair
+                        if (angleDiff >= 15 && angleDiff <= 22) pairScore += 0.15;  // Ideal angle ~18°
+                        if (avgCentroidDist >= 0.60 && avgCentroidDist <= 0.75) pairScore += 0.10;
+
+                        // Use midpoint as base
+                        var midBase = new PointF(
+                            (c1.basePoint.X + c2.basePoint.X) / 2,
+                            (c1.basePoint.Y + c2.basePoint.Y) / 2);
+
+                        Console.WriteLine($"  Y-pair: {c1.angle:F0}° + {c2.angle:F0}° = {avgAngle:F0}°, " +
+                            $"diff={angleDiff:F0}°, dist={avgCentroidDist:F2}R, score={pairScore:F2}");
+
+                        yShapeCandidates.Add((pairScore, avgAngle, combinedArea,
+                            c1.contour, c2.contour, midBase));
+                    }
+                }
+            }
+        }
+
+        // Only add Y-shape if no good single-contour arrow found
+        var bestSingleScore = allCandidates.Count > 0 ? allCandidates.Max(c => c.score) : 0;
+        foreach (var yc in yShapeCandidates)
+        {
+            // Only use Y-shape if it scores higher than best single contour
+            if (yc.score > bestSingleScore)
+            {
+                allCandidates.Add((yc.score, 0.5, yc.angle, yc.combinedArea, 0.7, 0.85,
+                    yc.contour1, yc.basePoint, "Y-Shape"));
             }
         }
 
@@ -559,11 +647,10 @@ class Program
             var maskedRotatedBinary = new Image<Gray, byte>(rotatedImage.Size);
             CvInvoke.BitwiseAnd(rotBinaryResult, rotDataMask, maskedRotatedBinary);
 
-            // Step 6: Morphological operations to clean up noise and fill small holes
+            // Step 6: Morphological cleanup (reduced CLOSE to preserve Y-shape)
             var rotKernel = CvInvoke.GetStructuringElement(ElementShape.Ellipse, new Size(3, 3), new Point(-1, -1));
             CvInvoke.MorphologyEx(maskedRotatedBinary, maskedRotatedBinary, MorphOp.Open, rotKernel, new Point(-1, -1), 1, BorderType.Default, new MCvScalar(0));
-            var rotLargerKernel = CvInvoke.GetStructuringElement(ElementShape.Ellipse, new Size(5, 5), new Point(-1, -1));
-            CvInvoke.MorphologyEx(maskedRotatedBinary, maskedRotatedBinary, MorphOp.Close, rotLargerKernel, new Point(-1, -1), 2, BorderType.Default, new MCvScalar(0));
+            CvInvoke.MorphologyEx(maskedRotatedBinary, maskedRotatedBinary, MorphOp.Close, rotKernel, new Point(-1, -1), 1, BorderType.Default, new MCvScalar(0));
 
             // Save debug images
             rotEnhancedImg.Save(outputPrefix + "_clahe.png");
@@ -742,35 +829,45 @@ class Program
         else
             centroidScore = 0.3;
 
-        // Solidity score - arrow (Y/triangle) has LOW solidity (0.4-0.7)
-        // Data marks are more rectangular and have HIGH solidity (0.8-1.0)
+        // Solidity score - arrow (Y/triangle) has LOW solidity (0.4-0.78)
+        // Data marks are more rectangular and have HIGH solidity (0.90-1.0)
+        // This is the MOST IMPORTANT distinguishing feature
         double solidityScore;
         if (solidity < 0.55)
             solidityScore = 1.0;  // Very likely arrow
         else if (solidity < 0.65)
-            solidityScore = 0.8;
+            solidityScore = 0.9;
         else if (solidity < 0.75)
-            solidityScore = 0.5;
+            solidityScore = 0.7;
+        else if (solidity < 0.82)
+            solidityScore = 0.4;
+        else if (solidity < 0.90)
+            solidityScore = 0.15;  // Marginal - might be arrow with filled gaps
         else
-            solidityScore = 0.1;  // Likely data mark, not arrow
+            solidityScore = 0.0;  // Very HIGH solidity = definitely NOT arrow
 
         // Elongation score - arrow is elongated (radially stretched)
-        // Data marks are more compact
         double elongationScore;
         if (elongation >= 1.5 && elongation <= 4.0)
-            elongationScore = 1.0;  // Good arrow elongation
+            elongationScore = 1.0;
         else if (elongation >= 1.0 && elongation <= 5.0)
             elongationScore = 0.6;
         else
             elongationScore = 0.2;
 
-        // Area score - arrow has specific size range
+        // Area score
         double expectedArea = outerR * outerR * 0.015;
         double areaRatio = area / expectedArea;
         double areaScore = (areaRatio >= 0.2 && areaRatio <= 5.0) ? 0.8 : 0.3;
 
-        return directionScore * 0.15 + tipPositionScore * 0.20 +
-               centroidScore * 0.10 + solidityScore * 0.30 +
-               elongationScore * 0.15 + areaScore * 0.10;
+        // Combined score - balance solidity AND elongation
+        // Both low solidity AND high elongation are needed for arrow
+        double combinedSolidityElongation = (solidityScore + elongationScore) / 2;
+        if (solidity < 0.80 && elongation >= 1.4)
+            combinedSolidityElongation += 0.2;  // Bonus for having both good traits
+
+        return directionScore * 0.10 + tipPositionScore * 0.15 +
+               centroidScore * 0.10 + combinedSolidityElongation * 0.55 +
+               areaScore * 0.10;
     }
 }

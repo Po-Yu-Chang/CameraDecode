@@ -2217,7 +2217,7 @@ namespace CameraMaui.RingCode
                 new MCvScalar(0, 0, 255), 1);
 
             // Draw inner circle (red)
-            CvInvoke.Circle(visualization, Point.Round(result.Center), (int)(result.OuterRadius * INNER_RATIO),
+            CvInvoke.Circle(visualization, Point.Round(result.Center), (int)result.InnerRadius,
                 new MCvScalar(0, 0, 255), 2);
 
             // Draw center point (green)
@@ -2233,8 +2233,8 @@ namespace CameraMaui.RingCode
                 double angle = startAngle + (i * segmentRad) - segmentRad;
 
                 // Line from center to outer edge
-                int x1 = (int)(result.Center.X + result.OuterRadius * INNER_RATIO * 0.8 * Math.Cos(angle));
-                int y1 = (int)(result.Center.Y + result.OuterRadius * INNER_RATIO * 0.8 * Math.Sin(angle));
+                int x1 = (int)(result.Center.X + result.InnerRadius * 0.9 * Math.Cos(angle));
+                int y1 = (int)(result.Center.Y + result.InnerRadius * 0.9 * Math.Sin(angle));
                 int x2 = (int)(result.Center.X + result.OuterRadius * Math.Cos(angle));
                 int y2 = (int)(result.Center.Y + result.OuterRadius * Math.Sin(angle));
 
@@ -2243,7 +2243,7 @@ namespace CameraMaui.RingCode
             }
 
             // Draw sample points (green X marks) ONLY on WHITE (filled) segments
-            float innerR = result.OuterRadius * (float)INNER_RATIO;
+            float innerR = result.InnerRadius;
             float centerR = result.MiddleRadius;
             float outerR = result.OuterRadius;
 
@@ -2412,7 +2412,7 @@ namespace CameraMaui.RingCode
                 CvInvoke.Circle(visualization, Point.Round(result.Center), (int)result.MiddleRadius, mainColor, 1);
 
                 // Draw inner circle
-                CvInvoke.Circle(visualization, Point.Round(result.Center), (int)(result.OuterRadius * INNER_RATIO), mainColor, 2);
+                CvInvoke.Circle(visualization, Point.Round(result.Center), (int)result.InnerRadius, mainColor, 2);
 
                 // Draw center point
                 CvInvoke.Circle(visualization, Point.Round(result.Center), 4, new MCvScalar(0, 0, 255), -1);
@@ -2426,8 +2426,8 @@ namespace CameraMaui.RingCode
                     double angle = startAngle + (i * segmentRad) - segmentRad;
 
                     // Line from inner to outer edge
-                    int x1 = (int)(result.Center.X + result.OuterRadius * INNER_RATIO * 0.9 * Math.Cos(angle));
-                    int y1 = (int)(result.Center.Y + result.OuterRadius * INNER_RATIO * 0.9 * Math.Sin(angle));
+                    int x1 = (int)(result.Center.X + result.InnerRadius * 0.9 * Math.Cos(angle));
+                    int y1 = (int)(result.Center.Y + result.InnerRadius * 0.9 * Math.Sin(angle));
                     int x2 = (int)(result.Center.X + result.OuterRadius * Math.Cos(angle));
                     int y2 = (int)(result.Center.Y + result.OuterRadius * Math.Sin(angle));
 
@@ -2435,7 +2435,7 @@ namespace CameraMaui.RingCode
                 }
 
                 // Draw sample points (green X marks) ONLY on WHITE (filled) segments
-                float innerR = result.OuterRadius * (float)INNER_RATIO;
+                float innerR = result.InnerRadius;
                 float centerR = result.MiddleRadius;
                 float outerR = result.OuterRadius;
 

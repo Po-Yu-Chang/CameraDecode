@@ -295,13 +295,16 @@ namespace CameraMaui.RingCode
                     return null;
                 }
 
-                // Create region
+                // Use radial scanning to find actual white ring boundaries
+                var (innerR, outerR, dataOuterR) = FindWhiteRingBoundaries(original, bestCenter, bestRadius);
+
+                // Create region with correct radii
                 var region = new RingRegion
                 {
                     Center = bestCenter,
-                    OuterRadius = bestRadius,
-                    InnerRadius = bestRadius * 0.35f,
-                    BoundingBox = GetBoundingBox(bestCenter, bestRadius * 1.1f, original.Size),
+                    OuterRadius = dataOuterR,  // Use data ring outer, not physical
+                    InnerRadius = innerR,      // Use actual inner radius from scan
+                    BoundingBox = GetBoundingBox(bestCenter, outerR * 1.1f, original.Size),
                     MatchScore = CalculatePatternScore(original, bestCenter, bestRadius)
                 };
 
@@ -432,15 +435,18 @@ namespace CameraMaui.RingCode
                 // This fixes cases where inner circle is detected instead of outer boundary
                 float refinedRadius = RefineOuterRadius(original, center, radius);
 
+                // Use radial scanning to find actual white ring boundaries
+                var (innerR, outerR, dataOuterR) = FindWhiteRingBoundaries(original, center, refinedRadius);
+
                 // Calculate pattern score
                 double patternScore = CalculatePatternScore(original, center, refinedRadius);
 
                 var region = new RingRegion
                 {
                     Center = center,
-                    OuterRadius = refinedRadius,
-                    InnerRadius = refinedRadius * 0.35f,
-                    BoundingBox = GetBoundingBox(center, refinedRadius * 1.1f, original.Size),
+                    OuterRadius = dataOuterR,  // Use data ring outer, not physical
+                    InnerRadius = innerR,      // Use actual inner radius from scan
+                    BoundingBox = GetBoundingBox(center, outerR * 1.1f, original.Size),
                     MatchScore = patternScore
                 };
 
@@ -849,6 +855,119 @@ namespace CameraMaui.RingCode
                 .OrderBy(r => Math.Floor(r.Center.Y / rowTolerance))
                 .ThenBy(r => r.Center.X)
                 .ToList();
+        }
+
+        /// <summary>
+        /// Find actual white ring boundaries using radial scanning
+        /// Returns (innerRadius, outerRadius, dataRingOuterRadius)
+        /// </summary>
+        public (float innerR, float outerR, float dataOuterR) FindWhiteRingBoundaries(
+            Image<Gray, byte> source, PointF center, float physicalRadius)
+        {
+            int cx = (int)center.X;
+            int cy = (int)center.Y;
+            int numAngles = 36;  // Every 10 degrees
+
+            var whiteRingStartRadii = new List<float>();
+            var whiteRingEndRadii = new List<float>();
+
+            for (int a = 0; a < numAngles; a++)
+            {
+                double angle = a * 2 * Math.PI / numAngles;
+                float cosA = (float)Math.Cos(angle);
+                float sinA = (float)Math.Sin(angle);
+
+                // Phase 1: Find where white ring starts (skip black center)
+                float whiteStart = 0;
+                bool inWhiteRing = false;
+                int consecutiveWhite = 0;
+
+                for (float r = 20; r < physicalRadius * 1.2f; r += 2)
+                {
+                    int x = (int)(cx + r * cosA);
+                    int y = (int)(cy + r * sinA);
+                    if (x < 0 || x >= source.Width || y < 0 || y >= source.Height) break;
+
+                    byte pixel = source.Data[y, x, 0];
+
+                    if (pixel > 180)  // Bright white pixel
+                    {
+                        consecutiveWhite++;
+                        if (!inWhiteRing && consecutiveWhite > 5)
+                        {
+                            whiteStart = r - 10;
+                            inWhiteRing = true;
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        consecutiveWhite = 0;
+                    }
+                }
+
+                if (!inWhiteRing) continue;
+
+                // Phase 2: Find where white ring ends (transition to dark background)
+                float whiteEnd = 0;
+                int consecutiveDark = 0;
+
+                for (float r = whiteStart; r < physicalRadius * 1.3f; r += 2)
+                {
+                    int x = (int)(cx + r * cosA);
+                    int y = (int)(cy + r * sinA);
+                    if (x < 0 || x >= source.Width || y < 0 || y >= source.Height) break;
+
+                    byte pixel = source.Data[y, x, 0];
+
+                    if (pixel < 100)  // Dark pixel
+                    {
+                        consecutiveDark++;
+                        if (consecutiveDark > 20)
+                        {
+                            // This is the outer dark background
+                            whiteEnd = r - 40;
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        consecutiveDark = 0;
+                    }
+                }
+
+                if (whiteEnd > whiteStart)
+                {
+                    whiteRingStartRadii.Add(whiteStart);
+                    whiteRingEndRadii.Add(whiteEnd);
+                }
+            }
+
+            // Calculate ring boundaries using median for robustness
+            float innerRadius, outerRadius, dataOuterRadius;
+            if (whiteRingStartRadii.Count > 10)
+            {
+                whiteRingStartRadii.Sort();
+                whiteRingEndRadii.Sort();
+
+                innerRadius = whiteRingStartRadii[whiteRingStartRadii.Count / 2];
+                outerRadius = whiteRingEndRadii[whiteRingEndRadii.Count / 2];
+
+                // Data ring outer = 97% of white ring (arrow tip is at outer edge of data)
+                dataOuterRadius = innerRadius + (outerRadius - innerRadius) * 0.97f;
+
+                Log($"  White ring scan: inner={innerRadius:F0}, outer={outerRadius:F0}, dataOuter={dataOuterRadius:F0}");
+            }
+            else
+            {
+                // Fallback based on physical radius
+                innerRadius = physicalRadius * 0.40f;
+                outerRadius = physicalRadius;
+                dataOuterRadius = physicalRadius * 0.97f;
+                Log($"  White ring scan fallback: inner={innerRadius:F0}, outer={outerRadius:F0}");
+            }
+
+            return (innerRadius, outerRadius, dataOuterRadius);
         }
     }
 }

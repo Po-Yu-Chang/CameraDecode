@@ -1019,14 +1019,10 @@ namespace CameraMaui.RingCode
         {
             int cx = (int)region.Center.X;
             int cy = (int)region.Center.Y;
-            float physicalOuterR = region.OuterRadius;
-            float innerR = region.InnerRadius;
+            float outerR = region.OuterRadius;  // Now correctly set to data ring outer by RingImageSegmentation
+            float innerR = region.InnerRadius;  // Now correctly set by radial scan
 
-            // CRITICAL: Adjust outerR to DATA RING boundary (not physical ring)
-            // Physical ring includes outer edge, but data marks are at ~95% of white ring
-            // This matches the test program's radial scan adjustment
-            float outerR = innerR + (physicalOuterR - innerR) * 0.97f;
-            Log($"    Ring adjustment: physical={physicalOuterR:F0}, data={outerR:F0}");
+            Log($"    Ring radii: inner={innerR:F0}, outer={outerR:F0}");
 
             // === RING-BASED PREPROCESSING ===
             // Create mask for DATA RING area (where arrow is located)

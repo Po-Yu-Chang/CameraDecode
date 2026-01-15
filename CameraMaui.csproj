@@ -1,5 +1,11 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+	<!-- Exclude TestArrowDetection from MAUI build -->
+	<ItemGroup>
+		<Compile Remove="TestArrowDetection\**" />
+		<None Remove="TestArrowDetection\**" />
+	</ItemGroup>
+
 	<PropertyGroup>
 		<!-- Target only Android and Windows -->
 		<TargetFrameworks>net8.0-android;net8.0-windows10.0.19041.0</TargetFrameworks>

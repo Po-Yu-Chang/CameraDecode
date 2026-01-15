@@ -1020,127 +1020,145 @@ namespace CameraMaui.RingCode
             int cx = (int)region.Center.X;
             int cy = (int)region.Center.Y;
             float outerR = region.OuterRadius;
+            float innerR = region.InnerRadius;
 
+            // === RING-BASED PREPROCESSING ===
             // Create mask for DATA RING area (where arrow is located)
-            // Arrow is INSIDE the data ring (the white donut), not at the outer edge
-            var mask = new Image<Gray, byte>(original.Size);
-            float innerMaskR = outerR * (float)ARROW_MIN_DIST_RATIO;  // 0.50R - inner edge of data area
-            float outerMaskR = outerR * (float)ARROW_MAX_DIST_RATIO;  // 0.98R - outer edge of data area
+            var dataMask = new Image<Gray, byte>(original.Size);
+            CvInvoke.Circle(dataMask, new Point(cx, cy), (int)outerR, new MCvScalar(255), -1);
+            CvInvoke.Circle(dataMask, new Point(cx, cy), (int)innerR, new MCvScalar(0), -1);
 
-            // Draw ring-shaped mask for the entire data ring area
-            CvInvoke.Circle(mask, new Point(cx, cy), (int)outerMaskR, new MCvScalar(255), -1);
-            CvInvoke.Circle(mask, new Point(cx, cy), (int)innerMaskR, new MCvScalar(0), -1);
+            // Apply CLAHE for uneven lighting correction
+            var enhanced = new Mat();
+            CvInvoke.CLAHE(original, 2.0, new System.Drawing.Size(8, 8), enhanced);
+            var enhancedImg = enhanced.ToImage<Gray, byte>();
 
-            // Try multiple thresholding methods
-            var binary = new Image<Gray, byte>(original.Size);
-            var binaryInv = new Image<Gray, byte>(original.Size);
-            CvInvoke.Threshold(original, binary, 0, 255, ThresholdType.Binary | ThresholdType.Otsu);
-            CvInvoke.BitwiseNot(binary, binaryInv);
-
-            // Collect candidates from both methods
-            var allCandidates = new List<(double score, double solidity, double angle, double area,
-                double centroidDistRatio, double tipDistRatio, int vertices, VectorOfPoint contour,
-                PointF centroid, PointF tipPoint, bool tipPointsOutward, string method)>();
-
-            var binaryImages = new[] { (binary, "Otsu"), (binaryInv, "OtsuInv") };
-
-            foreach (var (binaryImg, methodName) in binaryImages)
+            // Collect pixel values from ring area only for statistical thresholding
+            var ringPixels = new List<byte>();
+            for (int y = 0; y < enhancedImg.Height; y++)
             {
-                var maskedBinary = new Image<Gray, byte>(original.Size);
-                CvInvoke.BitwiseAnd(binaryImg, mask, maskedBinary);
-
-                using var contours = new VectorOfVectorOfPoint();
-                using var hierarchy = new Mat();
-                CvInvoke.FindContours(maskedBinary.Clone(), contours, hierarchy, RetrType.External, ChainApproxMethod.ChainApproxSimple);
-
-                // Arrow characteristics - small triangular shape at outer edge
-                double minArea = 30;
-                double maxArea = outerR * outerR * 0.08;  // Arrow is small, max ~8% of circle area
-
-                for (int i = 0; i < contours.Size; i++)
+                for (int x = 0; x < enhancedImg.Width; x++)
                 {
-                    var contour = contours[i];
-                    double area = CvInvoke.ContourArea(contour);
-                    if (area < minArea || area > maxArea) continue;
-
-                    var moments = CvInvoke.Moments(contour);
-                    if (moments.M00 < 1) continue;
-
-                    float ctrX = (float)(moments.M10 / moments.M00);
-                    float ctrY = (float)(moments.M01 / moments.M00);
-                    PointF centroid = new PointF(ctrX, ctrY);
-
-                    // CENTROID must be in outer edge zone
-                    double centroidDist = Math.Sqrt(Math.Pow(ctrX - cx, 2) + Math.Pow(ctrY - cy, 2));
-                    double centroidDistRatio = centroidDist / outerR;
-
-                    // Arrow centroid must be inside data ring (0.50R - 0.98R)
-                    if (centroidDistRatio < ARROW_MIN_DIST_RATIO || centroidDistRatio > ARROW_MAX_DIST_RATIO)
-                        continue;
-
-                    // Find TIP point (furthest from center) and BASE point (closest to center)
-                    var points = contour.ToArray();
-                    PointF tipPoint = centroid;
-                    PointF basePoint = centroid;
-                    double maxTipDist = 0;
-                    double minBaseDist = double.MaxValue;
-
-                    foreach (var pt in points)
+                    if (dataMask.Data[y, x, 0] > 0)
                     {
-                        double d = Math.Sqrt(Math.Pow(pt.X - cx, 2) + Math.Pow(pt.Y - cy, 2));
-                        if (d > maxTipDist)
-                        {
-                            maxTipDist = d;
-                            tipPoint = new PointF(pt.X, pt.Y);
-                        }
-                        if (d < minBaseDist)
-                        {
-                            minBaseDist = d;
-                            basePoint = new PointF(pt.X, pt.Y);
-                        }
+                        ringPixels.Add(enhancedImg.Data[y, x, 0]);
                     }
+                }
+            }
 
-                    double tipDistRatio = maxTipDist / outerR;
+            // Calculate optimal threshold from ring area statistics
+            double meanValue = ringPixels.Count > 0 ? ringPixels.Average(p => (double)p) : 128;
+            double stdDev = ringPixels.Count > 0 ? Math.Sqrt(ringPixels.Average(p => Math.Pow(p - meanValue, 2))) : 30;
+            double calculatedThresh = meanValue - 1.5 * stdDev;
+            byte optimalThresh = (byte)Math.Max(80, Math.Min(180, calculatedThresh));
 
-                    // CRITICAL: Arrow tip should point OUTWARD (tip further from center than base)
-                    // Tip should be at ~1.0-1.1R, base should be at ~0.9-1.0R
-                    bool tipPointsOutward = maxTipDist > minBaseDist && (maxTipDist - minBaseDist) > 5;
+            Log($"    Ring-based threshold: {optimalThresh} (mean={meanValue:F0}, std={stdDev:F0})");
 
-                    // Calculate solidity
-                    using var hull = new VectorOfPoint();
-                    CvInvoke.ConvexHull(contour, hull);
-                    double hullArea = CvInvoke.ContourArea(hull);
-                    double solidity = hullArea > 0 ? area / hullArea : 1.0;
+            // Apply binary threshold to find dark marks
+            var binaryResult = new Image<Gray, byte>(enhancedImg.Size);
+            CvInvoke.Threshold(enhancedImg, binaryResult, optimalThresh, 255, ThresholdType.BinaryInv);
 
-                    // Count vertices
-                    using var approx = new VectorOfPoint();
-                    CvInvoke.ApproxPolyDP(contour, approx, CvInvoke.ArcLength(contour, true) * 0.03, true);
-                    int vertices = approx.Size;
+            // Apply mask
+            var maskedBinary = new Image<Gray, byte>(original.Size);
+            CvInvoke.BitwiseAnd(binaryResult, dataMask, maskedBinary);
 
-                    // Calculate angle from center to TIP (not centroid)
-                    double angle = Math.Atan2(tipPoint.Y - cy, tipPoint.X - cx) * 180.0 / Math.PI;
-                    if (angle < 0) angle += 360;
+            // Morphological cleanup
+            var kernel = CvInvoke.GetStructuringElement(ElementShape.Ellipse, new System.Drawing.Size(3, 3), new Point(-1, -1));
+            CvInvoke.MorphologyEx(maskedBinary, maskedBinary, MorphOp.Open, kernel, new Point(-1, -1), 1, BorderType.Default, new MCvScalar(0));
+            var largerKernel = CvInvoke.GetStructuringElement(ElementShape.Ellipse, new System.Drawing.Size(5, 5), new Point(-1, -1));
+            CvInvoke.MorphologyEx(maskedBinary, maskedBinary, MorphOp.Close, largerKernel, new Point(-1, -1), 2, BorderType.Default, new MCvScalar(0));
 
-                    // Multi-feature scoring with emphasis on position and direction
-                    double score = CalculateArrowScore(solidity, centroidDistRatio, tipDistRatio,
-                        area, vertices, outerR, tipPointsOutward);
+            // Collect candidates from preprocessed binary
+            var allCandidates = new List<(double score, double solidity, double angle, double area,
+                double centroidDistRatio, double tipDistRatio, double elongation, VectorOfPoint contour,
+                PointF centroid, PointF basePoint, bool tipPointsOutward, string method)>();
 
-                    if (score > 0)
+            using var contours = new VectorOfVectorOfPoint();
+            using var hierarchy = new Mat();
+            CvInvoke.FindContours(maskedBinary.Clone(), contours, hierarchy, RetrType.External, ChainApproxMethod.ChainApproxSimple);
+
+            // Arrow characteristics - reasonable area based on ring size
+            double minArea = outerR * outerR * 0.005;  // ~0.5% of ring area
+            double maxArea = outerR * outerR * 0.10;   // ~10% of ring area
+
+            for (int i = 0; i < contours.Size; i++)
+            {
+                var contour = contours[i];
+                double area = CvInvoke.ContourArea(contour);
+                if (area < minArea || area > maxArea) continue;
+
+                var moments = CvInvoke.Moments(contour);
+                if (moments.M00 < 1) continue;
+
+                float ctrX = (float)(moments.M10 / moments.M00);
+                float ctrY = (float)(moments.M01 / moments.M00);
+                PointF centroid = new PointF(ctrX, ctrY);
+
+                double centroidDist = Math.Sqrt(Math.Pow(ctrX - cx, 2) + Math.Pow(ctrY - cy, 2));
+                double centroidDistRatio = centroidDist / outerR;
+
+                // Find TIP point (furthest from center) and BASE point (closest to center)
+                var points = contour.ToArray();
+                PointF tipPoint = centroid;
+                PointF basePoint = centroid;
+                double maxTipDist = 0;
+                double minBaseDist = double.MaxValue;
+
+                foreach (var pt in points)
+                {
+                    double d = Math.Sqrt(Math.Pow(pt.X - cx, 2) + Math.Pow(pt.Y - cy, 2));
+                    if (d > maxTipDist)
                     {
-                        var contourCopy = new VectorOfPoint(contour.ToArray());
-                        allCandidates.Add((score, solidity, angle, area, centroidDistRatio, tipDistRatio,
-                            vertices, contourCopy, centroid, tipPoint, tipPointsOutward, methodName));
+                        maxTipDist = d;
+                        tipPoint = new PointF(pt.X, pt.Y);
+                    }
+                    if (d < minBaseDist)
+                    {
+                        minBaseDist = d;
+                        basePoint = new PointF(pt.X, pt.Y);
                     }
                 }
 
-                maskedBinary.Dispose();
+                double tipDistRatio = maxTipDist / outerR;
+
+                // Arrow tip should point OUTWARD
+                bool tipPointsOutward = maxTipDist > minBaseDist && (maxTipDist - minBaseDist) > 3;
+
+                // Calculate solidity - arrow (Y/triangle) has LOW solidity
+                using var hull = new VectorOfPoint();
+                CvInvoke.ConvexHull(contour, hull);
+                double hullArea = CvInvoke.ContourArea(hull);
+                double solidity = hullArea > 0 ? area / hullArea : 1.0;
+
+                // Calculate elongation ratio (tip-base distance vs sqrt(area))
+                double elongation = (maxTipDist - minBaseDist) / Math.Sqrt(area);
+
+                // Calculate angle from center to BASE point (closest point) - this is the arrow direction
+                double angle = Math.Atan2(basePoint.Y - cy, basePoint.X - cx) * 180.0 / Math.PI;
+                if (angle < 0) angle += 360;
+
+                // Multi-feature scoring with emphasis on solidity and elongation
+                double score = CalculateArrowScore(solidity, centroidDistRatio, tipDistRatio,
+                    area, outerR, tipPointsOutward, elongation);
+
+                if (score > 0.1)
+                {
+                    var contourCopy = new VectorOfPoint(contour.ToArray());
+                    allCandidates.Add((score, solidity, angle, area, centroidDistRatio, tipDistRatio,
+                        elongation, contourCopy, centroid, basePoint, tipPointsOutward, "Preprocessed"));
+                }
             }
 
-            mask.Dispose();
-            binary.Dispose();
-            binaryInv.Dispose();
+            // Cleanup
+            dataMask.Dispose();
+            enhanced.Dispose();
+            enhancedImg.Dispose();
+            binaryResult.Dispose();
+            maskedBinary.Dispose();
+            kernel.Dispose();
+            largerKernel.Dispose();
 
-            Log($"    Found {allCandidates.Count} arrow candidates at outer edge");
+            Log($"    Found {allCandidates.Count} arrow candidates");
 
             if (allCandidates.Count > 0)
             {
@@ -1152,7 +1170,7 @@ namespace CameraMaui.RingCode
                     var c = sortedCandidates[i];
                     Log($"    #{i+1}: score={c.score:F2}, solidity={c.solidity:F3}, " +
                         $"centroid={c.centroidDistRatio:F2}R, tip={c.tipDistRatio:F2}R, " +
-                        $"angle={c.angle:F0}°, outward={c.tipPointsOutward}, method={c.method}");
+                        $"elongation={c.elongation:F2}, angle={c.angle:F0}°, method={c.method}");
                 }
 
                 var best = sortedCandidates[0];
@@ -1163,84 +1181,76 @@ namespace CameraMaui.RingCode
                     double snappedAngle = sector * 15.0;
 
                     _lastArrowContour = best.contour;
-                    _lastArrowTip = best.tipPoint;
+                    _lastArrowTip = best.basePoint;  // Store base point for visualization
 
                     Log($"  Arrow found: score={best.score:F2}, angle={best.angle:F1}° -> sector {sector} ({snappedAngle}°)");
                     return snappedAngle;
                 }
             }
 
-            Log($"  No arrow found at outer edge");
+            Log($"  No arrow found");
             return double.MinValue;
         }
 
         /// <summary>
         /// Calculate arrow confidence score using multiple features
-        /// CRITICAL: Arrow is INSIDE the data ring (0.50R-0.98R), tip points OUTWARD toward outer edge
+        /// CRITICAL: Arrow has LOW solidity (Y/triangle shape) and is elongated radially
         /// </summary>
         private double CalculateArrowScore(double solidity, double centroidDistRatio, double tipDistRatio,
-            double area, int vertices, float outerR, bool tipPointsOutward)
+            double area, float outerR, bool tipPointsOutward, double elongation)
         {
-            // Feature 1: Tip points outward (MOST IMPORTANT for arrow)
-            // Arrow tip should point away from center
+            // Feature 1: Direction - tip should point outward
             double directionScore = tipPointsOutward ? 1.0 : 0.3;
 
             // Feature 2: Tip position - should be at OUTER part of data ring (0.80R - 0.98R)
             double tipPositionScore;
-            if (tipDistRatio >= ARROW_TIP_MIN_RATIO && tipDistRatio <= ARROW_TIP_MAX_RATIO)  // 0.80-0.98R
-                tipPositionScore = 1.0;  // Perfect - tip at outer edge of data ring
+            if (tipDistRatio >= 0.80 && tipDistRatio <= 0.98)
+                tipPositionScore = 1.0;
             else if (tipDistRatio >= 0.70 && tipDistRatio <= 1.02)
-                tipPositionScore = 0.6;  // Acceptable
+                tipPositionScore = 0.6;
             else
-                tipPositionScore = 0.2;  // Out of expected range
+                tipPositionScore = 0.2;
 
-            // Feature 3: Centroid position - should be in middle/outer part of data ring (0.70R - 0.92R)
-            double centroidPositionScore;
+            // Feature 3: Centroid position - should be in data ring (0.70R - 0.92R)
+            double centroidScore;
             if (centroidDistRatio >= 0.70 && centroidDistRatio <= 0.92)
-                centroidPositionScore = 1.0;
+                centroidScore = 1.0;
             else if (centroidDistRatio >= 0.60 && centroidDistRatio <= 0.98)
-                centroidPositionScore = 0.6;
+                centroidScore = 0.6;
             else
-                centroidPositionScore = 0.3;
+                centroidScore = 0.3;
 
-            // Feature 4: Solidity (arrow has LOW solidity ~0.4-0.70)
+            // Feature 4: Solidity - arrow (Y/triangle) has LOW solidity (0.4-0.7)
+            // Data marks are more rectangular and have HIGH solidity (0.8-1.0)
             double solidityScore;
-            if (solidity < ARROW_SOLIDITY_CONFIDENT)  // < 0.60
-                solidityScore = 1.0;
-            else if (solidity < ARROW_SOLIDITY_THRESHOLD)  // < 0.75
-                solidityScore = 0.7;
-            else if (solidity < 0.85)
-                solidityScore = 0.4;
+            if (solidity < 0.55)
+                solidityScore = 1.0;  // Very likely arrow
+            else if (solidity < 0.65)
+                solidityScore = 0.8;
+            else if (solidity < 0.75)
+                solidityScore = 0.5;
             else
-                solidityScore = 0.1;  // High solidity = likely not arrow
+                solidityScore = 0.1;  // Likely data mark, not arrow
 
-            // Feature 5: Vertex count (triangles have 3-5 vertices)
-            double vertexScore;
-            if (vertices >= 3 && vertices <= 5)
-                vertexScore = 1.0;
-            else if (vertices >= 6 && vertices <= 8)
-                vertexScore = 0.5;
+            // Feature 5: Elongation - arrow is elongated (radially stretched)
+            // Data marks are more compact
+            double elongationScore;
+            if (elongation >= 1.5 && elongation <= 4.0)
+                elongationScore = 1.0;  // Good arrow elongation
+            else if (elongation >= 1.0 && elongation <= 5.0)
+                elongationScore = 0.6;
             else
-                vertexScore = 0.2;
+                elongationScore = 0.2;
 
-            // Feature 6: Area (arrow can be small to medium size)
-            double expectedArrowArea = outerR * outerR * 0.015;  // ~1.5% of circle area
-            double areaRatio = area / expectedArrowArea;
-            double areaScore;
-            if (areaRatio >= 0.2 && areaRatio <= 6.0)  // Allow larger arrows
-                areaScore = 0.8;
-            else
-                areaScore = 0.3;
+            // Feature 6: Area - arrow has specific size range
+            double expectedArea = outerR * outerR * 0.015;
+            double areaRatio = area / expectedArea;
+            double areaScore = (areaRatio >= 0.2 && areaRatio <= 5.0) ? 0.8 : 0.3;
 
-            // Combined score with weights - direction and position are most important
-            double combinedScore = directionScore * 0.25 +      // Tip points outward
-                                   tipPositionScore * 0.25 +     // Tip at outer edge
-                                   centroidPositionScore * 0.15 +
-                                   solidityScore * 0.20 +        // Low solidity
-                                   vertexScore * 0.10 +
-                                   areaScore * 0.05;
-
-            return combinedScore;
+            // Combined score - solidity is most important for distinguishing arrow from data marks
+            return directionScore * 0.15 + tipPositionScore * 0.20 +
+                   centroidScore * 0.10 + solidityScore * 0.30 +
+                   elongationScore * 0.15 + areaScore * 0.10;
         }
 
         /// <summary>

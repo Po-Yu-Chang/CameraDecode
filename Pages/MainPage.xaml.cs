@@ -1,4 +1,5 @@
 using CameraMaui.RingCode;
+using CameraMaui.Services;
 using Emgu.CV;
 using Emgu.CV.Structure;
 using Newtonsoft.Json;
@@ -7,7 +8,7 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
 
-namespace CameraMaui
+namespace CameraMaui.Pages
 {
     public partial class MainPage : ContentPage
     {
@@ -48,9 +49,14 @@ namespace CameraMaui
             _ringCodeDecoder = new RingCodeDecoder();
             _imageSegmentation = new RingImageSegmentation();
 
-            // Connect decoder log to our log
+            // Connect decoder and segmentation logs to our log
             RingCodeDecoder.Log = Log;
-            RingCodeDecoder.EnableDetailedLog = true;
+            RingCodeDecoder.EnableDetailedLog = false;  // Set to true for detailed per-segment logs
+            RingImageSegmentation.Log = Log;
+
+            // Initialize arrow templates for decoder
+            _ringCodeDecoder.InitializeTemplates();
+            Log($"Templates loaded - Dark: {_ringCodeDecoder.HasDarkTemplate}, Light: {_ringCodeDecoder.HasLightTemplate}");
 
             // Test orientation service
             var orientation = _deviceOrientationService?.GetOrentation() ?? DeviceOrientation.Undefined;
@@ -223,7 +229,7 @@ namespace CameraMaui
                             (int)(fullBitmap.Width * scale),
                             (int)(fullBitmap.Height * scale),
                             SKColorType.Bgra8888, SKAlphaType.Premul);
-                        _currentImage = fullBitmap.Resize(resizeInfo, SKSamplingOptions.Default);
+                        _currentImage = fullBitmap.Resize(resizeInfo, SKFilterQuality.Medium);
                         fullBitmap.Dispose();
                     }
                     else
@@ -248,7 +254,7 @@ namespace CameraMaui
                             (int)(_currentImage.Width * scale),
                             (int)(_currentImage.Height * scale),
                             SKColorType.Bgra8888, SKAlphaType.Premul);
-                        displayBitmap = _currentImage.Resize(resizeInfo, SKSamplingOptions.Default);
+                        displayBitmap = _currentImage.Resize(resizeInfo, SKFilterQuality.Medium);
                     }
 
                     // Save display image
@@ -315,7 +321,7 @@ namespace CameraMaui
 
                         // Fast resize using SKBitmap.Resize with new API
                         var resizeInfo = new SKImageInfo(newWidth, newHeight, SKColorType.Bgra8888, SKAlphaType.Premul);
-                        displayBitmap = originalBitmap.Resize(resizeInfo, SKSamplingOptions.Default);
+                        displayBitmap = originalBitmap.Resize(resizeInfo, SKFilterQuality.Medium);
                     }
                     else if (originalBitmap.ColorType != SKColorType.Bgra8888)
                     {
@@ -525,12 +531,14 @@ namespace CameraMaui
                 List<RingCodeDecoder.RingCodeResult> allResults = null;
                 RingImageSegmentation.SegmentationResult segmentResult = null;
 
+                var totalSw = System.Diagnostics.Stopwatch.StartNew();
                 await Task.Run(() =>
                 {
                     // Step 1: Segment the image to find all rings
+                    var segSw = System.Diagnostics.Stopwatch.StartNew();
                     Log("Step 1: Segmenting image...");
                     segmentResult = _imageSegmentation.SegmentImage(_currentEmguImage);
-                    Log($"Segmentation result: {segmentResult.Message}, Rings found: {segmentResult.DetectedRings.Count}");
+                    Log($"Segmentation: {segSw.ElapsedMilliseconds}ms, Rings found: {segmentResult.DetectedRings.Count}");
 
                     MainThread.BeginInvokeOnMainThread(() =>
                     {
@@ -550,10 +558,12 @@ namespace CameraMaui
                     }
 
                     // Step 2: Decode all detected rings
+                    var decodeSw = System.Diagnostics.Stopwatch.StartNew();
                     Log("Step 2: Decoding all rings...");
                     allResults = _ringCodeDecoder.DecodeAllRings(_currentEmguImage);
-                    Log($"Decoded {allResults.Count} ring(s)");
+                    Log($"Decoding: {decodeSw.ElapsedMilliseconds}ms for {allResults.Count} ring(s)");
                 });
+                Log($"Total analysis time: {totalSw.ElapsedMilliseconds}ms");
 
                 // Step 3: Display results on UI thread
                 if (allResults != null && allResults.Count > 0)
@@ -573,7 +583,26 @@ namespace CameraMaui
                         {
                             var result = allResults[0];
                             lblBinary.Text = result.BinaryString;
-                            lblDecoded.Text = result.IsValid ? result.DecodedData : $"Error: {result.ErrorMessage}";
+
+                            // Build error message including template match errors
+                            if (result.IsValid)
+                            {
+                                lblDecoded.Text = result.DecodedData;
+                            }
+                            else
+                            {
+                                var errorMsg = !string.IsNullOrEmpty(result.ErrorMessage)
+                                    ? result.ErrorMessage
+                                    : "解碼失敗";
+
+                                // Add template match error if present
+                                if (!string.IsNullOrEmpty(result.TemplateMatchError))
+                                {
+                                    errorMsg += $"\n範本比對: {result.TemplateMatchError}";
+                                }
+                                lblDecoded.Text = $"錯誤: {errorMsg}";
+                            }
+
                             lblDetails.Text = $"Center: ({result.Center.X:F0}, {result.Center.Y:F0}), " +
                                             $"R: {result.OuterRadius:F0}, Angle: {result.RotationAngle:F1}°";
                         }
@@ -585,10 +614,28 @@ namespace CameraMaui
                                 .Select(r => $"#{r.RingIndex}: {r.DecodedData}")
                                 .ToList();
 
+                            // Check for any template match errors in invalid results
+                            var templateErrors = allResults
+                                .Where(r => !r.IsValid && !string.IsNullOrEmpty(r.TemplateMatchError))
+                                .Select(r => $"#{r.RingIndex}: {r.TemplateMatchError}")
+                                .ToList();
+
                             lblBinary.Text = $"({allResults.Count} rings detected)";
-                            lblDecoded.Text = decodedValues.Count > 0
-                                ? string.Join(" | ", decodedValues)
-                                : "No valid codes decoded";
+
+                            if (decodedValues.Count > 0)
+                            {
+                                lblDecoded.Text = string.Join(" | ", decodedValues);
+                            }
+                            else
+                            {
+                                var errorText = "無有效解碼結果";
+                                if (templateErrors.Count > 0)
+                                {
+                                    errorText += $"\n範本比對錯誤: {string.Join("; ", templateErrors)}";
+                                }
+                                lblDecoded.Text = errorText;
+                            }
+
                             lblDetails.Text = $"Total: {allResults.Count} rings, Valid: {validCount}, Invalid: {invalidCount}";
                         }
 
@@ -674,15 +721,16 @@ namespace CameraMaui
         {
             _isSourceTabActive = isSourceTab;
 
-            // Update tab button appearance
-            tabSource.BackgroundColor = isSourceTab ? Color.FromArgb("#e94560") : Color.FromArgb("#16213e");
-            tabSource.TextColor = isSourceTab ? Colors.White : Color.FromArgb("#888888");
+            // Update tab button appearance (use new color scheme)
+            tabSource.BackgroundColor = isSourceTab ? Color.FromArgb("#F9C846") : Color.FromArgb("#2B8B8B");
+            tabSource.TextColor = isSourceTab ? Color.FromArgb("#1E4B5C") : Color.FromArgb("#F5EFE0");
 
-            tabResult.BackgroundColor = !isSourceTab ? Color.FromArgb("#e94560") : Color.FromArgb("#16213e");
-            tabResult.TextColor = !isSourceTab ? Colors.White : Color.FromArgb("#888888");
+            tabResult.BackgroundColor = !isSourceTab ? Color.FromArgb("#F9C846") : Color.FromArgb("#2B8B8B");
+            tabResult.TextColor = !isSourceTab ? Color.FromArgb("#1E4B5C") : Color.FromArgb("#F5EFE0");
 
-            // Toggle visibility
+            // Toggle visibility - need to toggle both Frame and ScrollView
             sourceScrollView.IsVisible = isSourceTab;
+            resultFrame.IsVisible = !isSourceTab;
             resultScrollView.IsVisible = !isSourceTab;
 
             // Reset zoom for the active tab
@@ -769,6 +817,23 @@ namespace CameraMaui
                 lblStatus.Text = $"Status: Error - {ex.Message}";
                 MyLabel.Text = $"Error: {ex.Message}";
                 await DisplayAlert("Error", ex.Message, "OK");
+            }
+        }
+
+        /// <summary>
+        /// Open the Arrow Template Creator page
+        /// </summary>
+        private async void OnTemplateCreatorClicked(object sender, EventArgs e)
+        {
+            Log("Opening Template Creator page...");
+            try
+            {
+                await Shell.Current.GoToAsync(nameof(TemplateCreatorPage));
+            }
+            catch (Exception ex)
+            {
+                Log($"ERROR opening Template Creator: {ex}");
+                await DisplayAlert("Error", $"Failed to open Template Creator: {ex.Message}", "OK");
             }
         }
 
@@ -864,6 +929,8 @@ namespace CameraMaui
 
         private Image<Bgr, byte> ConvertSKBitmapToEmguImage(SKBitmap skBitmap)
         {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+
             // Ensure bitmap is in BGRA8888 format
             SKBitmap convertedBitmap = skBitmap;
             if (skBitmap.ColorType != SKColorType.Bgra8888)
@@ -873,21 +940,27 @@ namespace CameraMaui
                 canvas.DrawBitmap(skBitmap, 0, 0);
             }
 
-            var image = new Image<Bgr, byte>(convertedBitmap.Width, convertedBitmap.Height);
+            int width = convertedBitmap.Width;
+            int height = convertedBitmap.Height;
+            var image = new Image<Bgr, byte>(width, height);
 
-            // Use GetPixelSpan for safer memory access
-            var pixels = convertedBitmap.GetPixelSpan();
+            // Use unsafe pointer access for much faster conversion
+            IntPtr pixelsPtr = convertedBitmap.GetPixels();
+            int rowBytes = convertedBitmap.RowBytes;
 
-            for (int y = 0; y < convertedBitmap.Height; y++)
+            unsafe
             {
-                for (int x = 0; x < convertedBitmap.Width; x++)
+                byte* srcPtr = (byte*)pixelsPtr.ToPointer();
+
+                for (int y = 0; y < height; y++)
                 {
-                    int i = (y * convertedBitmap.Width + x) * 4;
-                    if (i + 2 < pixels.Length)
+                    byte* rowPtr = srcPtr + y * rowBytes;
+                    for (int x = 0; x < width; x++)
                     {
-                        image.Data[y, x, 0] = pixels[i];     // B
-                        image.Data[y, x, 1] = pixels[i + 1]; // G
-                        image.Data[y, x, 2] = pixels[i + 2]; // R
+                        int offset = x * 4; // BGRA format
+                        image.Data[y, x, 0] = rowPtr[offset];     // B
+                        image.Data[y, x, 1] = rowPtr[offset + 1]; // G
+                        image.Data[y, x, 2] = rowPtr[offset + 2]; // R
                     }
                 }
             }
@@ -898,29 +971,47 @@ namespace CameraMaui
                 convertedBitmap.Dispose();
             }
 
+            Log($"ConvertSKBitmapToEmguImage: {width}x{height} in {sw.ElapsedMilliseconds}ms");
             return image;
         }
 
         private SKBitmap ConvertEmguImageToSKBitmap(Image<Bgr, byte> image)
         {
-            var skBitmap = new SKBitmap(image.Width, image.Height, SKColorType.Bgra8888, SKAlphaType.Premul);
+            var sw = System.Diagnostics.Stopwatch.StartNew();
 
-            // Use Pixels property for safer access
-            var pixels = skBitmap.Pixels;
+            int width = image.Width;
+            int height = image.Height;
 
-            for (int y = 0; y < image.Height; y++)
+            // Create bitmap with proper color space
+            var info = new SKImageInfo(width, height, SKColorType.Bgra8888, SKAlphaType.Premul);
+            var skBitmap = new SKBitmap(info);
+
+            // Use unsafe pointer access for much faster conversion
+            IntPtr pixelsPtr = skBitmap.GetPixels();
+            int rowBytes = skBitmap.RowBytes;
+
+            unsafe
             {
-                for (int x = 0; x < image.Width; x++)
+                byte* dstPtr = (byte*)pixelsPtr.ToPointer();
+
+                for (int y = 0; y < height; y++)
                 {
-                    int idx = y * image.Width + x;
-                    byte b = image.Data[y, x, 0];
-                    byte g = image.Data[y, x, 1];
-                    byte r = image.Data[y, x, 2];
-                    pixels[idx] = new SKColor(r, g, b, 255);
+                    byte* rowPtr = dstPtr + y * rowBytes;
+                    for (int x = 0; x < width; x++)
+                    {
+                        int offset = x * 4; // BGRA format
+                        rowPtr[offset] = image.Data[y, x, 0];     // B
+                        rowPtr[offset + 1] = image.Data[y, x, 1]; // G
+                        rowPtr[offset + 2] = image.Data[y, x, 2]; // R
+                        rowPtr[offset + 3] = 255;                  // A
+                    }
                 }
             }
 
-            skBitmap.Pixels = pixels;
+            // Notify bitmap that pixels have changed
+            skBitmap.NotifyPixelsChanged();
+
+            Log($"ConvertEmguImageToSKBitmap: {width}x{height} in {sw.ElapsedMilliseconds}ms");
             return skBitmap;
         }
 
@@ -939,11 +1030,32 @@ namespace CameraMaui
             if (skBitmap == null)
                 throw new ArgumentNullException(nameof(skBitmap));
 
-            using var memoryStream = new MemoryStream();
-            skBitmap.Encode(memoryStream, SKEncodedImageFormat.Png, 100);
-            memoryStream.Position = 0;
-
-            return ImageSource.FromStream(() => new MemoryStream(memoryStream.ToArray()));
+            try
+            {
+                // Save to temp file (more reliable than stream)
+                string tempPath = Path.Combine(FileSystem.CacheDirectory, $"result_{DateTime.Now.Ticks}.png");
+                using (var fs = File.OpenWrite(tempPath))
+                {
+                    bool encoded = skBitmap.Encode(fs, SKEncodedImageFormat.Png, 100);
+                    if (!encoded)
+                    {
+                        Log($"ERROR: Failed to encode bitmap {skBitmap.Width}x{skBitmap.Height}, ColorType={skBitmap.ColorType}");
+                        // Try JPEG as fallback
+                        fs.SetLength(0);
+                        encoded = skBitmap.Encode(fs, SKEncodedImageFormat.Jpeg, 90);
+                    }
+                    if (!encoded)
+                    {
+                        throw new Exception($"Failed to encode bitmap: {skBitmap.Width}x{skBitmap.Height}, ColorType={skBitmap.ColorType}");
+                    }
+                }
+                return ImageSource.FromFile(tempPath);
+            }
+            catch (Exception ex)
+            {
+                Log($"ERROR in ConvertSkBitmapToImageSource: {ex.Message}");
+                throw;
+            }
         }
 
         #endregion

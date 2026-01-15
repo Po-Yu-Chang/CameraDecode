@@ -1,0 +1,181 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage
+    x:Class="CameraMaui.Pages.MainPage"
+    xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+    xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+    xmlns:cv="clr-namespace:Camera.MAUI;assembly=Camera.MAUI"
+    Title="Ring Code Scanner"
+    BackgroundColor="#F5EFE0">
+
+    <ContentPage.Resources>
+        <!-- 卡片樣式 - 青綠色主題 -->
+        <Style x:Key="CardFrame" TargetType="Frame">
+            <Setter Property="BackgroundColor" Value="#2B8B8B"/>
+            <Setter Property="BorderColor" Value="#1E5B5B"/>
+            <Setter Property="CornerRadius" Value="16"/>
+            <Setter Property="Padding" Value="12"/>
+            <Setter Property="HasShadow" Value="True"/>
+        </Style>
+        
+        <!-- 次要卡片樣式 - 深藍色主題 -->
+        <Style x:Key="SecondaryCardFrame" TargetType="Frame">
+            <Setter Property="BackgroundColor" Value="#1E4B5C"/>
+            <Setter Property="BorderColor" Value="#153A48"/>
+            <Setter Property="CornerRadius" Value="16"/>
+            <Setter Property="Padding" Value="12"/>
+            <Setter Property="HasShadow" Value="True"/>
+        </Style>
+        
+        <Style x:Key="HeaderLabel" TargetType="Label">
+            <Setter Property="FontAttributes" Value="Bold"/>
+            <Setter Property="FontSize" Value="16"/>
+            <Setter Property="TextColor" Value="#F9C846"/>
+        </Style>
+        
+        <!-- 主要動作按鈕 - 金黃色 -->
+        <Style x:Key="ActionButton" TargetType="Button">
+            <Setter Property="CornerRadius" Value="12"/>
+            <Setter Property="FontAttributes" Value="Bold"/>
+            <Setter Property="HeightRequest" Value="48"/>
+            <Setter Property="FontSize" Value="14"/>
+            <Setter Property="BackgroundColor" Value="#F9C846"/>
+            <Setter Property="TextColor" Value="#1E4B5C"/>
+        </Style>
+        
+        <!-- 次要按鈕 - 青綠色 -->
+        <Style x:Key="SecondaryButton" TargetType="Button">
+            <Setter Property="CornerRadius" Value="12"/>
+            <Setter Property="FontAttributes" Value="Bold"/>
+            <Setter Property="HeightRequest" Value="48"/>
+            <Setter Property="FontSize" Value="14"/>
+            <Setter Property="BackgroundColor" Value="#2B8B8B"/>
+            <Setter Property="TextColor" Value="White"/>
+        </Style>
+        
+        <Style x:Key="ZoomButton" TargetType="Button">
+            <Setter Property="CornerRadius" Value="10"/>
+            <Setter Property="WidthRequest" Value="40"/>
+            <Setter Property="HeightRequest" Value="36"/>
+            <Setter Property="BackgroundColor" Value="#1E5B5B"/>
+            <Setter Property="TextColor" Value="#F9C846"/>
+            <Setter Property="FontAttributes" Value="Bold"/>
+            <Setter Property="Padding" Value="0"/>
+        </Style>
+        
+        <Style x:Key="TabButton" TargetType="Button">
+            <Setter Property="CornerRadius" Value="10"/>
+            <Setter Property="HeightRequest" Value="40"/>
+            <Setter Property="FontSize" Value="14"/>
+            <Setter Property="FontAttributes" Value="Bold"/>
+            <Setter Property="Padding" Value="20,0"/>
+        </Style>
+    </ContentPage.Resources>
+
+    <Grid RowDefinitions="*,Auto,Auto" Padding="12">
+
+        <!-- 主要區域：標籤式圖像區 -->
+        <Frame Grid.Row="0" Style="{StaticResource CardFrame}" Padding="0">
+            <Grid RowDefinitions="Auto,*">
+                <!-- 標籤頭部 -->
+                <Grid ColumnDefinitions="Auto,Auto,*,Auto" BackgroundColor="#1E5B5B" Padding="10,8">
+                    <!-- 標籤按鈕 -->
+                    <Button x:Name="tabSource" Text="📷 原始圖" Style="{StaticResource TabButton}"
+                            BackgroundColor="#F9C846" TextColor="#1E4B5C" Clicked="OnTabSourceClicked" />
+                    <Button x:Name="tabResult" Text="📊 結果" Style="{StaticResource TabButton}" Grid.Column="1"
+                            BackgroundColor="#2B8B8B" TextColor="#F5EFE0" Clicked="OnTabResultClicked" Margin="6,0,0,0" />
+
+                    <!-- 縮放控制（右側） -->
+                    <HorizontalStackLayout Grid.Column="3" Spacing="6" VerticalOptions="Center">
+                        <Button Text="−" Style="{StaticResource ZoomButton}" Clicked="OnZoomOutClicked" />
+                        <Frame BackgroundColor="#1E4B5C" CornerRadius="8" Padding="8,4" HasShadow="False" BorderColor="Transparent">
+                            <Label x:Name="lblZoom" Text="Fit" TextColor="#F9C846" FontAttributes="Bold" FontSize="12" WidthRequest="40" HorizontalTextAlignment="Center" />
+                        </Frame>
+                        <Button Text="+" Style="{StaticResource ZoomButton}" Clicked="OnZoomInClicked" />
+                        <Button Text="⟲" Style="{StaticResource ZoomButton}" Clicked="OnZoomResetClicked" />
+                    </HorizontalStackLayout>
+                </Grid>
+
+                <!-- 標籤內容 -->
+                <Grid Grid.Row="1" BackgroundColor="#F5EFE0" Margin="10">
+                    <Frame CornerRadius="12" Padding="0" HasShadow="False" BackgroundColor="White" BorderColor="#E8E4D9">
+                        <!-- 原始圖標籤 -->
+                        <ScrollView x:Name="sourceScrollView" Orientation="Both" HorizontalOptions="Fill" VerticalOptions="Fill" IsVisible="True">
+                            <Image
+                                x:Name="sourceImage"
+                                Aspect="AspectFit"
+                                HorizontalOptions="Center"
+                                VerticalOptions="Center"
+                                BackgroundColor="Transparent" />
+                        </ScrollView>
+                    </Frame>
+
+                    <!-- 結果圖標籤 -->
+                    <Frame CornerRadius="12" Padding="0" HasShadow="False" BackgroundColor="White" BorderColor="#E8E4D9" x:Name="resultFrame" IsVisible="False">
+                        <ScrollView x:Name="resultScrollView" Orientation="Both" HorizontalOptions="Fill" VerticalOptions="Fill">
+                            <Image
+                                x:Name="processedImage"
+                                Aspect="AspectFit"
+                                HorizontalOptions="Center"
+                                VerticalOptions="Center"
+                                BackgroundColor="Transparent" />
+                        </ScrollView>
+                    </Frame>
+
+                    <!-- 空狀態 -->
+                    <VerticalStackLayout x:Name="emptyState" IsVisible="False" HorizontalOptions="Center" VerticalOptions="Center" Spacing="12">
+                        <Frame BackgroundColor="#F9C846" CornerRadius="50" WidthRequest="80" HeightRequest="80" Padding="0" HasShadow="False" HorizontalOptions="Center" BorderColor="Transparent">
+                            <Label Text="📷" FontSize="36" HorizontalOptions="Center" VerticalOptions="Center" />
+                        </Frame>
+                        <Label Text="尚未載入圖片" TextColor="#1E4B5C" FontSize="18" FontAttributes="Bold" HorizontalOptions="Center" />
+                        <Label Text="使用下方按鈕載入圖片" TextColor="#6B6660" FontSize="14" HorizontalOptions="Center" />
+                    </VerticalStackLayout>
+                </Grid>
+            </Grid>
+        </Frame>
+
+        <!-- 結果面板 -->
+        <Frame Grid.Row="1" Style="{StaticResource SecondaryCardFrame}" Margin="0,10,0,0" Padding="14">
+            <Grid ColumnDefinitions="*,Auto" RowDefinitions="Auto,Auto" ColumnSpacing="14" RowSpacing="6">
+                <!-- 左側：解碼結果 -->
+                <Grid ColumnDefinitions="Auto,*" RowDefinitions="Auto,Auto,Auto" ColumnSpacing="10" RowSpacing="6">
+                    <Label Text="狀態:" TextColor="#7BC5C5" FontSize="13" VerticalOptions="Center" />
+                    <Label x:Name="lblStatus" Text="就緒" TextColor="#F9C846" FontSize="13" FontAttributes="Bold" Grid.Column="1" VerticalOptions="Center" />
+
+                    <Label Text="二進位:" TextColor="#7BC5C5" FontSize="13" Grid.Row="1" VerticalOptions="Center" />
+                    <Label x:Name="lblBinary" Text="-" TextColor="#F5EFE0" FontFamily="Consolas" FontSize="12" Grid.Row="1" Grid.Column="1" LineBreakMode="TailTruncation" VerticalOptions="Center" />
+
+                    <Label Text="解碼:" TextColor="#7BC5C5" FontSize="13" Grid.Row="2" VerticalOptions="Center" />
+                    <Label x:Name="lblDecoded" Text="-" TextColor="#F9C846" FontSize="16" FontAttributes="Bold" Grid.Row="2" Grid.Column="1" VerticalOptions="Center" />
+                </Grid>
+
+                <!-- 右側：環數徽章 -->
+                <Frame Grid.Column="1" BackgroundColor="#F9C846" CornerRadius="14" Padding="16,12" HasShadow="False" VerticalOptions="Center" BorderColor="Transparent">
+                    <VerticalStackLayout Spacing="2">
+                        <Label x:Name="lblRingCount" Text="0" TextColor="#1E4B5C" FontSize="28" FontAttributes="Bold" HorizontalOptions="Center" />
+                        <Label Text="環數" TextColor="#1E4B5C" FontSize="11" FontAttributes="Bold" HorizontalOptions="Center" />
+                    </VerticalStackLayout>
+                </Frame>
+
+                <!-- 底部：詳細資訊 -->
+                <Label x:Name="lblDetails" Text="" TextColor="#5A8B9C" FontSize="11" Grid.Row="1" Grid.ColumnSpan="2" />
+                <Label x:Name="MyLabel" Text="" TextColor="#5A8B9C" FontSize="11" Grid.Row="1" Grid.Column="1" HorizontalTextAlignment="End" />
+            </Grid>
+        </Frame>
+
+        <!-- 底部：動作按鈕 -->
+        <Grid Grid.Row="2" ColumnDefinitions="*,*,*,*,*,*,*" ColumnSpacing="8" Padding="0,10,0,0">
+            <Button Grid.Column="0" Text="📸" Style="{StaticResource ActionButton}" Clicked="OnCaptureClicked" x:Name="btnCapture" ToolTipProperties.Text="拍照" />
+            <Button Grid.Column="1" Text="📁" Style="{StaticResource SecondaryButton}" Clicked="OnSelectImageClicked" x:Name="btnSelectImage" ToolTipProperties.Text="選擇圖片" />
+            <Button Grid.Column="2" Text="📂" Style="{StaticResource SecondaryButton}" BackgroundColor="#4A8B5C" Clicked="OnLoadPathClicked" x:Name="btnLoadPath" ToolTipProperties.Text="載入路徑" />
+            <Button Grid.Column="3" Text="🔍" Style="{StaticResource ActionButton}" Clicked="OnAnalyzeClicked" x:Name="btnAnalyze" FontSize="18" ToolTipProperties.Text="分析" />
+            <Button Grid.Column="4" Text="🗑️" Style="{StaticResource SecondaryButton}" BackgroundColor="#8A8578" Clicked="OnClearClicked" x:Name="btnClear" ToolTipProperties.Text="清除" />
+            <Button Grid.Column="5" Text="🎯" Style="{StaticResource SecondaryButton}" BackgroundColor="#1E4B5C" Clicked="OnTestWithSampleClicked" ToolTipProperties.Text="測試範本" />
+            <Button Grid.Column="6" Text="⚙️" Style="{StaticResource ActionButton}" BackgroundColor="#F9C846" Clicked="OnTemplateCreatorClicked" ToolTipProperties.Text="箭頭範本" />
+        </Grid>
+
+        <!-- Hidden Camera View -->
+        <cv:CameraView x:Name="cameraView" CamerasLoaded="cameraView_CamerasLoaded" IsVisible="False" HeightRequest="0" />
+
+    </Grid>
+
+</ContentPage>

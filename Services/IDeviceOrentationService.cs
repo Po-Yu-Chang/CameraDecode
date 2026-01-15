@@ -5,7 +5,7 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 
-namespace CameraMaui
+namespace CameraMaui.Services
 {
     public enum DeviceOrientation
     {

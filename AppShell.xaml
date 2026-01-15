@@ -3,12 +3,16 @@
     x:Class="CameraMaui.AppShell"
     xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
     xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
-    xmlns:local="clr-namespace:CameraMaui"
-    Shell.FlyoutBehavior="Disabled">
+    xmlns:pages="clr-namespace:CameraMaui.Pages"
+    Shell.FlyoutBehavior="Disabled"
+    Shell.BackgroundColor="#2B8B8B"
+    Shell.ForegroundColor="#F5EFE0"
+    Shell.TitleColor="#F9C846"
+    Shell.NavBarHasShadow="True">
 
     <ShellContent
-        Title="Home"
-        ContentTemplate="{DataTemplate local:MainPage}"
+        Title="Ring Code Scanner"
+        ContentTemplate="{DataTemplate pages:MainPage}"
         Route="MainPage" />
 
 </Shell>

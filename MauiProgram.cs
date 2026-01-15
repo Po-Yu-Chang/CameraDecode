@@ -1,7 +1,10 @@
 ﻿using Microsoft.Extensions.Logging;
 using CameraMaui;
+using CameraMaui.Pages;
+using CameraMaui.Services;
 using Camera.MAUI;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using SkiaSharp.Views.Maui.Controls.Hosting;
 
 namespace CameraMaui
 {
@@ -13,6 +16,7 @@ namespace CameraMaui
             builder
                 .UseMauiApp<App>()
                 .UseMauiCameraView()
+                .UseSkiaSharp()
                 .ConfigureFonts(fonts =>
                 {
                     fonts.AddFont("OpenSans-Regular.ttf", "OpenSansRegular");

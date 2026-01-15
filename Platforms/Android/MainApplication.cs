@@ -1,6 +1,7 @@
 ﻿using Android.App;
 using Android.Runtime;
 using CameraMaui.Platforms;
+using CameraMaui.Services;
 
 namespace CameraMaui
 {

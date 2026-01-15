@@ -1,4 +1,5 @@
 ﻿using Camera.MAUI;
+using CameraMaui.Services;
 
 namespace CameraMaui
 {

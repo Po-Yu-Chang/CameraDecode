@@ -8,6 +8,7 @@ using Android.Runtime;
 using Android.Views;
 using System.Drawing;
 using CameraMaui;
+using CameraMaui.Services;
 using Emgu.CV;
 using Emgu.CV.Structure;
 using SkiaSharp;

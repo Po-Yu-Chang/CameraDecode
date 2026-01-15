@@ -38,32 +38,41 @@ namespace CameraMaui.RingCode
 
         // Detection parameters - relaxed for better detection
         private readonly int _minRadius = 25;
-        private readonly int _maxRadius = 150;
+        private readonly int _maxRadius = 500;  // Increased for single large ring
         private readonly double _circularityThreshold = 0.55; // More lenient
+
+        // Logging
+        public static Action<string> Log { get; set; } = (msg) => System.Diagnostics.Debug.WriteLine($"[Segmentation] {msg}");
 
         /// <summary>
         /// Main segmentation method
         /// </summary>
         public SegmentationResult SegmentImage(Image<Bgr, byte> sourceImage)
         {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
             var result = new SegmentationResult();
 
             try
             {
                 var gray = sourceImage.Convert<Gray, byte>();
+                Log($"Gray convert: {sw.ElapsedMilliseconds}ms");
 
                 // Step 1: CLAHE for contrast normalization
                 var normalized = ApplyCLAHE(gray);
+                Log($"CLAHE: {sw.ElapsedMilliseconds}ms");
 
                 // Step 2: Enhance edges with morphology
                 var enhanced = EnhanceCircleEdges(normalized);
+                Log($"Edge enhance: {sw.ElapsedMilliseconds}ms");
 
                 // Step 3: Pyramid denoise
                 var denoised = ApplyPyramidDenoise(enhanced);
                 result.ProcessedImage = denoised;
+                Log($"Pyramid denoise: {sw.ElapsedMilliseconds}ms");
 
                 // Step 4: Multi-level detection
                 result.DetectedRings = FindRingCodesMultiLevel(denoised, normalized, gray);
+                Log($"Ring detection: {sw.ElapsedMilliseconds}ms, found {result.DetectedRings.Count}");
 
                 // Step 5: Sort by position
                 result.DetectedRings = SortRingsByPosition(result.DetectedRings);
@@ -78,6 +87,7 @@ namespace CameraMaui.RingCode
                     $"Found {result.DetectedRings.Count} ring code(s)" :
                     "No ring codes detected";
 
+                Log($"Segmentation total: {sw.ElapsedMilliseconds}ms");
                 return result;
             }
             catch (Exception ex)
@@ -146,17 +156,173 @@ namespace CameraMaui.RingCode
             // Method 1: Otsu threshold (fastest, most reliable)
             allRegions.AddRange(FindWithOtsuThreshold(preprocessed, original));
 
-            // Method 2: Single adaptive threshold (backup)
+            // Method 2: Inverted Otsu for white rings with gray marks
+            if (allRegions.Count == 0)
+            {
+                Log("Trying inverted threshold for white ring...");
+                allRegions.AddRange(FindWithInvertedThreshold(preprocessed, original));
+            }
+
+            // Method 3: Single adaptive threshold (backup)
             if (allRegions.Count < 10)
             {
                 allRegions.AddRange(FindWithAdaptiveThreshold(preprocessed, original,
                     AdaptiveThresholdType.GaussianC, 41, 4));
             }
 
+            // Method 4: Single large ring detection using HoughCircles
+            if (allRegions.Count == 0)
+            {
+                Log("Trying single large ring detection...");
+                var singleRing = FindSingleLargeRing(preprocessed, original);
+                if (singleRing != null)
+                {
+                    allRegions.Add(singleRing);
+                }
+            }
+
             // Merge with NMS
             var merged = ApplyNMS(allRegions, 0.5);
 
             return merged;
+        }
+
+        /// <summary>
+        /// Find rings using inverted threshold (for white rings with gray marks)
+        /// </summary>
+        private List<RingRegion> FindWithInvertedThreshold(Image<Gray, byte> preprocessed, Image<Gray, byte> original)
+        {
+            var regions = new List<RingRegion>();
+
+            // Invert the image
+            var inverted = preprocessed.Not();
+
+            var binary = new Image<Gray, byte>(inverted.Size);
+            CvInvoke.Threshold(inverted, binary, 0, 255, ThresholdType.Binary | ThresholdType.Otsu);
+
+            FindRingsInBinary(binary, original, regions);
+
+            return regions;
+        }
+
+        /// <summary>
+        /// Detect single large ring that fills most of the image
+        /// Uses center-based analysis and HoughCircles
+        /// </summary>
+        private RingRegion FindSingleLargeRing(Image<Gray, byte> preprocessed, Image<Gray, byte> original)
+        {
+            try
+            {
+                int imgWidth = original.Width;
+                int imgHeight = original.Height;
+                int minDim = Math.Min(imgWidth, imgHeight);
+
+                // Step 1: Apply Canny edge detection
+                var edges = new Image<Gray, byte>(preprocessed.Size);
+                CvInvoke.GaussianBlur(preprocessed, preprocessed, new System.Drawing.Size(5, 5), 1.5);
+                CvInvoke.Canny(preprocessed, edges, 30, 90);
+
+                // Step 2: Use HoughCircles to find circular patterns
+                var circles = CvInvoke.HoughCircles(
+                    preprocessed,
+                    HoughModes.Gradient,
+                    dp: 1.5,
+                    minDist: minDim / 4,
+                    param1: 100,
+                    param2: 40,
+                    minRadius: minDim / 8,
+                    maxRadius: minDim / 2);
+
+                if (circles.Length == 0)
+                {
+                    // Try with more lenient parameters
+                    circles = CvInvoke.HoughCircles(
+                        preprocessed,
+                        HoughModes.Gradient,
+                        dp: 2.0,
+                        minDist: minDim / 4,
+                        param1: 80,
+                        param2: 30,
+                        minRadius: minDim / 10,
+                        maxRadius: (int)(minDim * 0.6));
+                }
+
+                if (circles.Length == 0)
+                {
+                    Log("HoughCircles found no circles");
+                    return null;
+                }
+
+                // Find the largest circle near center
+                float bestScore = 0;
+                System.Drawing.PointF bestCenter = new System.Drawing.PointF(imgWidth / 2f, imgHeight / 2f);
+                float bestRadius = 0;
+
+                float imgCenterX = imgWidth / 2f;
+                float imgCenterY = imgHeight / 2f;
+
+                foreach (var circle in circles)
+                {
+                    float cx = circle.Center.X;
+                    float cy = circle.Center.Y;
+                    float r = circle.Radius;
+
+                    // Score: prefer larger radius + closer to center
+                    float distToCenter = (float)Math.Sqrt(Math.Pow(cx - imgCenterX, 2) + Math.Pow(cy - imgCenterY, 2));
+                    float normalizedDist = distToCenter / minDim;
+                    float score = r * (1.0f - normalizedDist * 0.5f);
+
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestCenter = new System.Drawing.PointF(cx, cy);
+                        bestRadius = r;
+                    }
+                }
+
+                if (bestRadius < minDim / 10)
+                {
+                    Log($"Best circle too small: {bestRadius}");
+                    return null;
+                }
+
+                Log($"Found single ring: center=({bestCenter.X:F0},{bestCenter.Y:F0}), radius={bestRadius:F0}");
+
+                // Validate pattern
+                if (!ValidateRingCodePattern(original, bestCenter, bestRadius))
+                {
+                    Log("Pattern validation failed");
+                    return null;
+                }
+
+                // Create region
+                var region = new RingRegion
+                {
+                    Center = bestCenter,
+                    OuterRadius = bestRadius,
+                    InnerRadius = bestRadius * 0.35f,
+                    BoundingBox = GetBoundingBox(bestCenter, bestRadius * 1.1f, original.Size),
+                    MatchScore = CalculatePatternScore(original, bestCenter, bestRadius)
+                };
+
+                if (region.BoundingBox.Width > 0 && region.BoundingBox.Height > 0)
+                {
+                    original.ROI = region.BoundingBox;
+                    region.CroppedImage = original.Clone();
+                    original.ROI = Rectangle.Empty;
+
+                    region.TrianglePoints = FindTriangleMarkers(original, region);
+                    region.RotationAngle = CalculateRotationAngle(region);
+
+                    return region;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"Single ring detection error: {ex.Message}");
+            }
+
+            return null;
         }
 
         /// <summary>
@@ -397,41 +563,141 @@ namespace CameraMaui.RingCode
         }
 
         /// <summary>
-        /// Refine outer radius - fast method
-        /// If detected radius is too small, expand to find outer boundary
+        /// Refine outer radius by finding the edge of data pattern
+        /// Key insight: Find where pattern ENDS (transition from high variance to low variance)
         /// </summary>
         private float RefineOuterRadius(Image<Gray, byte> source, PointF center, float initialRadius)
         {
-            // Quick check: if radius seems reasonable (> 45px), keep it
-            if (initialRadius > 45) return initialRadius;
-
-            // For small detected radius, check if there's pattern at 2x radius
             int cx = (int)center.X;
             int cy = (int)center.Y;
-            float testRadius = initialRadius * 2;
+            int numAngles = 24;
 
-            // Sample 12 points at 2x radius
-            int patternCount = 0;
-            for (int i = 0; i < 12; i++)
+            // Step 1: Determine if initialRadius is likely the inner hole or data ring
+            // Check if there's pattern at 1.0R, 1.5R, 2.0R
+            float[] testMultiples = { 1.0f, 1.3f, 1.6f, 2.0f };
+            float bestMultiple = 1.0f;
+            double bestPatternScore = 0;
+
+            foreach (float mult in testMultiples)
             {
-                double angle = i * Math.PI / 6;
-                int x = (int)(cx + testRadius * Math.Cos(angle));
-                int y = (int)(cy + testRadius * Math.Sin(angle));
+                float testR = initialRadius * mult;
+                if (testR > Math.Min(source.Width, source.Height) / 2f) continue;
 
-                if (x >= 0 && x < source.Width && y >= 0 && y < source.Height)
+                // Sample at 0.7 * testR (data ring area, not edge)
+                float sampleR = testR * 0.70f;
+                var intensities = new List<int>();
+
+                for (int a = 0; a < 48; a++)
                 {
-                    // Check if pixel has significant intensity variation from neighbors
-                    int val = source.Data[y, x, 0];
-                    if (val > 80 && val < 200) patternCount++;
+                    double angle = a * (2 * Math.PI / 48);
+                    int x = (int)(cx + sampleR * Math.Cos(angle));
+                    int y = (int)(cy + sampleR * Math.Sin(angle));
+
+                    if (x >= 0 && x < source.Width && y >= 0 && y < source.Height)
+                    {
+                        intensities.Add(source.Data[y, x, 0]);
+                    }
+                }
+
+                if (intensities.Count < 30) continue;
+
+                // Calculate pattern score (variance * transitions)
+                double mean = intensities.Average();
+                double variance = intensities.Sum(v => Math.Pow(v - mean, 2)) / intensities.Count;
+
+                int transitions = 0;
+                bool lastHigh = intensities[0] > mean;
+                for (int i = 1; i < intensities.Count; i++)
+                {
+                    bool curHigh = intensities[i] > mean;
+                    if (curHigh != lastHigh)
+                    {
+                        transitions++;
+                        lastHigh = curHigh;
+                    }
+                }
+
+                double score = Math.Sqrt(variance) * transitions;
+                Log($"    Test R={testR:F0} (mult={mult:F1}): variance={variance:F0}, transitions={transitions}, score={score:F0}");
+
+                if (score > bestPatternScore)
+                {
+                    bestPatternScore = score;
+                    bestMultiple = mult;
                 }
             }
 
-            // If pattern found at 2x radius, use it
-            return patternCount >= 6 ? testRadius : initialRadius;
+            float candidateRadius = initialRadius * bestMultiple;
+            Log($"    Best multiple: {bestMultiple:F1} -> candidateR={candidateRadius:F0}");
+
+            // Step 2: Fine-tune by finding outer edge (where pattern ends)
+            // Scan from candidateR * 0.85 to candidateR * 1.15 to find exact boundary
+            float[] outerEdgeEstimates = new float[numAngles];
+            int validEstimates = 0;
+
+            for (int a = 0; a < numAngles; a++)
+            {
+                double angle = a * (2 * Math.PI / numAngles);
+                double cosA = Math.Cos(angle);
+                double sinA = Math.Sin(angle);
+
+                // Scan outward to find where pattern ends
+                float lastPatternR = candidateRadius * 0.5f;
+
+                for (float testR = candidateRadius * 0.6f; testR <= candidateRadius * 1.3f; testR += 3)
+                {
+                    // Check if there's pattern at this radius (high local variance)
+                    var localIntensities = new List<int>();
+                    for (float dr = -5; dr <= 5; dr += 2)
+                    {
+                        int x = (int)(cx + (testR + dr) * cosA);
+                        int y = (int)(cy + (testR + dr) * sinA);
+                        if (x >= 0 && x < source.Width && y >= 0 && y < source.Height)
+                        {
+                            localIntensities.Add(source.Data[y, x, 0]);
+                        }
+                    }
+
+                    if (localIntensities.Count < 3) continue;
+
+                    double localMean = localIntensities.Average();
+                    double localVariance = localIntensities.Sum(v => Math.Pow(v - localMean, 2)) / localIntensities.Count;
+
+                    // Pattern exists if variance > 200 (not uniform)
+                    if (localVariance > 200)
+                    {
+                        lastPatternR = testR;
+                    }
+                }
+
+                // The outer edge is slightly beyond the last pattern location
+                if (lastPatternR > candidateRadius * 0.6f)
+                {
+                    outerEdgeEstimates[a] = lastPatternR * 1.05f;  // Add 5% margin
+                    validEstimates++;
+                }
+            }
+
+            // Step 3: Use median of estimates
+            if (validEstimates >= numAngles / 3)
+            {
+                var validRadii = outerEdgeEstimates.Where(r => r > 0).OrderBy(r => r).ToList();
+                float medianRadius = validRadii[validRadii.Count / 2];
+
+                // Sanity check
+                if (medianRadius >= initialRadius * 0.9f && medianRadius <= initialRadius * 2.5f)
+                {
+                    Log($"    Radius refined: {initialRadius:F0} -> {medianRadius:F0} (from {validEstimates} edge samples)");
+                    return medianRadius;
+                }
+            }
+
+            Log($"    Using candidate radius: {candidateRadius:F0}");
+            return candidateRadius;
         }
 
         /// <summary>
-        /// Apply Non-Maximum Suppression
+        /// Apply Non-Maximum Suppression + Remove nested rings
         /// </summary>
         private List<RingRegion> ApplyNMS(List<RingRegion> regions, double overlapThreshold)
         {
@@ -456,6 +722,54 @@ namespace CameraMaui.RingCode
                 });
             }
 
+            // Post-process: Remove smaller rings that are contained within larger rings
+            result = RemoveNestedRings(result);
+
+            return result;
+        }
+
+        /// <summary>
+        /// Remove smaller rings that are completely contained within a larger ring
+        /// This prevents false detections of code marks as separate rings
+        /// </summary>
+        private List<RingRegion> RemoveNestedRings(List<RingRegion> regions)
+        {
+            if (regions.Count <= 1) return regions;
+
+            // Sort by radius descending (largest first)
+            var sorted = regions.OrderByDescending(r => r.OuterRadius).ToList();
+            var result = new List<RingRegion>();
+
+            for (int i = 0; i < sorted.Count; i++)
+            {
+                var current = sorted[i];
+                bool isNested = false;
+
+                // Check if current ring is inside any larger ring in result
+                foreach (var larger in result)
+                {
+                    double distance = Math.Sqrt(
+                        Math.Pow(current.Center.X - larger.Center.X, 2) +
+                        Math.Pow(current.Center.Y - larger.Center.Y, 2));
+
+                    // If the smaller ring's center is within the larger ring's outer radius
+                    // AND the smaller ring is significantly smaller (< 60% of larger)
+                    // Then it's probably a false detection of a code mark
+                    if (distance < larger.OuterRadius * 0.9 &&
+                        current.OuterRadius < larger.OuterRadius * 0.6)
+                    {
+                        isNested = true;
+                        Log($"Removed nested ring: r={current.OuterRadius:F0} inside r={larger.OuterRadius:F0}");
+                        break;
+                    }
+                }
+
+                if (!isNested)
+                {
+                    result.Add(current);
+                }
+            }
+
             return result;
         }
 
@@ -473,97 +787,14 @@ namespace CameraMaui.RingCode
         }
 
         /// <summary>
-        /// Find arrow marker by analyzing blob shape
-        /// Arrow (Y-shape) has LOW solidity, regular segments have HIGH solidity
+        /// Find arrow marker - returns empty, decoder will handle arrow detection with templates
+        /// This avoids duplicate/conflicting detection logic
         /// </summary>
         private List<PointF> FindTriangleMarkers(Image<Gray, byte> source, RingRegion region)
         {
-            var trianglePoints = new List<PointF>();
-
-            try
-            {
-                int cx = (int)region.Center.X;
-                int cy = (int)region.Center.Y;
-                float outerR = region.OuterRadius;
-
-                // Step 1: Apply CLAHE + Otsu to get binary image
-                var normalized = new Image<Gray, byte>(source.Size);
-                CvInvoke.CLAHE(source, 2.0, new System.Drawing.Size(8, 8), normalized);
-
-                var binary = new Image<Gray, byte>(source.Size);
-                CvInvoke.Threshold(normalized, binary, 0, 255, ThresholdType.Binary | ThresholdType.Otsu);
-
-                // Step 2: Mask to outer ring area (0.5R to 1.1R)
-                var ringMask = new Image<Gray, byte>(source.Size);
-                CvInvoke.Circle(ringMask, new Point(cx, cy), (int)(outerR * 1.1), new MCvScalar(255), -1);
-                CvInvoke.Circle(ringMask, new Point(cx, cy), (int)(outerR * 0.5), new MCvScalar(0), -1);
-                var masked = binary.Copy(ringMask);
-
-                // Step 3: Find all separate blobs
-                using var contours = new VectorOfVectorOfPoint();
-                using var hierarchy = new Mat();
-                CvInvoke.FindContours(masked, contours, hierarchy, RetrType.External, ChainApproxMethod.ChainApproxSimple);
-
-                // Step 4: Find blob with LOWEST solidity (Y-shape has gaps between prongs)
-                // Solidity = Area / ConvexHullArea
-                double bestScore = 0;
-                int bestIdx = -1;
-                double minBlobArea = outerR * outerR * 0.02;
-
-                for (int i = 0; i < contours.Size; i++)
-                {
-                    var contour = contours[i];
-                    double area = CvInvoke.ContourArea(contour);
-
-                    if (area < minBlobArea) continue;
-
-                    // Calculate convex hull area
-                    using var hull = new VectorOfPoint();
-                    CvInvoke.ConvexHull(contour, hull);
-                    double hullArea = CvInvoke.ContourArea(hull);
-
-                    if (hullArea < 1) continue;
-
-                    // Solidity: low for Y-shape (0.4-0.7), high for rectangle (0.8-1.0)
-                    double solidity = area / hullArea;
-
-                    // Arrow should have solidity between 0.3 and 0.75
-                    // Score: prefer lower solidity + larger area
-                    if (solidity > 0.25 && solidity < 0.8)
-                    {
-                        double score = area * (1.0 - solidity);
-                        if (score > bestScore)
-                        {
-                            bestScore = score;
-                            bestIdx = i;
-                        }
-                    }
-                }
-
-                if (bestIdx < 0) return trianglePoints;
-
-                // Step 5: Find the tip (furthest point from ring center)
-                var arrowContour = contours[bestIdx];
-                var points = arrowContour.ToArray();
-
-                double maxDist = 0;
-                Point tipPoint = new Point(cx, cy);
-
-                foreach (var pt in points)
-                {
-                    double dist = Math.Sqrt(Math.Pow(pt.X - cx, 2) + Math.Pow(pt.Y - cy, 2));
-                    if (dist > maxDist)
-                    {
-                        maxDist = dist;
-                        tipPoint = pt;
-                    }
-                }
-
-                trianglePoints.Add(new PointF(tipPoint.X, tipPoint.Y));
-            }
-            catch { }
-
-            return trianglePoints;
+            // Arrow detection is handled by RingCodeDecoder with templates
+            // Return empty list here to avoid conflicting results
+            return new List<PointF>();
         }
 
         /// <summary>

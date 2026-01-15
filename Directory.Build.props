@@ -1,0 +1,16 @@
+<Project>
+  <!--
+    Android 建構工具（AAPT2）在部分環境下對含中文/特殊字元的路徑較敏感，
+    可能導致 APT2000 找不到 obj\...\assets。
+
+    重要：BaseIntermediateOutputPath 必須在匯入 Microsoft.Common.props 之前設定，
+    才不會造成 NuGet/SourceGen 產物分裂到兩個 obj 路徑，進而出現大量「重複定義」。
+
+    Directory.Build.props 會在 SDK 匯入前被載入，適合放這類設定。
+  -->
+  <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('windows'))">
+    <BaseIntermediateOutputPath>$(TEMP)\CameraMaui\obj\</BaseIntermediateOutputPath>
+    <MSBuildProjectExtensionsPath>$(TEMP)\CameraMaui\obj\</MSBuildProjectExtensionsPath>
+    <BaseOutputPath>$(TEMP)\CameraMaui\bin\</BaseOutputPath>
+  </PropertyGroup>
+</Project>

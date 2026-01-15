@@ -1,4 +1,4 @@
-namespace CameraMaui
+namespace CameraMaui.Services
 {
     /// <summary>
     /// Service helper to access DI services from anywhere in the app

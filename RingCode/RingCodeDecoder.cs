@@ -1019,8 +1019,14 @@ namespace CameraMaui.RingCode
         {
             int cx = (int)region.Center.X;
             int cy = (int)region.Center.Y;
-            float outerR = region.OuterRadius;
+            float physicalOuterR = region.OuterRadius;
             float innerR = region.InnerRadius;
+
+            // CRITICAL: Adjust outerR to DATA RING boundary (not physical ring)
+            // Physical ring includes outer edge, but data marks are at ~95% of white ring
+            // This matches the test program's radial scan adjustment
+            float outerR = innerR + (physicalOuterR - innerR) * 0.97f;
+            Log($"    Ring adjustment: physical={physicalOuterR:F0}, data={outerR:F0}");
 
             // === RING-BASED PREPROCESSING ===
             // Create mask for DATA RING area (where arrow is located)
@@ -1081,6 +1087,9 @@ namespace CameraMaui.RingCode
             double minArea = outerR * outerR * 0.005;  // ~0.5% of ring area
             double maxArea = outerR * outerR * 0.10;   // ~10% of ring area
 
+            // Create arrow template once for shape matching
+            var arrowTemplate = CreateArrowTemplate();
+
             for (int i = 0; i < contours.Size; i++)
             {
                 var contour = contours[i];
@@ -1137,9 +1146,41 @@ namespace CameraMaui.RingCode
                 double angle = Math.Atan2(basePoint.Y - cy, basePoint.X - cx) * 180.0 / Math.PI;
                 if (angle < 0) angle += 360;
 
-                // Multi-feature scoring with emphasis on solidity and elongation
-                double score = CalculateArrowScore(solidity, centroidDistRatio, tipDistRatio,
+                // === SHAPE MATCHING with Y-arrow template ===
+                double shapeMatchScore = CalculateShapeMatchScore(contour, arrowTemplate);
+
+                // Base score from multi-feature analysis
+                double baseScore = CalculateArrowScore(solidity, centroidDistRatio, tipDistRatio,
                     area, outerR, tipPointsOutward, elongation);
+
+                // Combined score: shape match is weighted heavily
+                double score;
+                if (shapeMatchScore >= 0.7)
+                {
+                    // Good shape match - trust it heavily
+                    score = baseScore * 0.3 + shapeMatchScore * 0.7;
+                }
+                else if (shapeMatchScore >= 0.5)
+                {
+                    // Medium shape match - balanced weighting
+                    score = baseScore * 0.5 + shapeMatchScore * 0.5;
+                }
+                else
+                {
+                    // Poor shape match - use base score but penalize
+                    score = baseScore * 0.8;
+                }
+
+                // PENALTY for very small contours - likely noise, not real arrow
+                double minExpectedArea = outerR * outerR * 0.02;  // ~2% of ring area
+                if (area < minExpectedArea && shapeMatchScore < 0.7)
+                {
+                    double areaRatio = area / minExpectedArea;
+                    double areaPenalty = 0.25 * (1.0 - areaRatio);
+                    if (areaRatio < 0.5)
+                        areaPenalty += 0.15;
+                    score -= areaPenalty;
+                }
 
                 if (score > 0.1)
                 {

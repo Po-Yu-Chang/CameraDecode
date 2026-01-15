@@ -858,7 +858,7 @@ namespace CameraMaui.RingCode
         }
 
         /// <summary>
-        /// Find actual white ring boundaries using radial scanning
+        /// Find actual white ring boundaries using radial scanning with adaptive thresholds
         /// Returns (innerRadius, outerRadius, dataRingOuterRadius)
         /// </summary>
         public (float innerR, float outerR, float dataOuterR) FindWhiteRingBoundaries(
@@ -867,6 +867,49 @@ namespace CameraMaui.RingCode
             int cx = (int)center.X;
             int cy = (int)center.Y;
             int numAngles = 36;  // Every 10 degrees
+
+            // Step 1: Sample pixels to determine adaptive thresholds
+            var ringPixels = new List<byte>();
+            var centerPixels = new List<byte>();
+
+            for (int a = 0; a < numAngles; a++)
+            {
+                double angle = a * 2 * Math.PI / numAngles;
+                float cosA = (float)Math.Cos(angle);
+                float sinA = (float)Math.Sin(angle);
+
+                // Sample center area (should be dark)
+                for (float r = 10; r < physicalRadius * 0.3f; r += 5)
+                {
+                    int x = (int)(cx + r * cosA);
+                    int y = (int)(cy + r * sinA);
+                    if (x >= 0 && x < source.Width && y >= 0 && y < source.Height)
+                        centerPixels.Add(source.Data[y, x, 0]);
+                }
+
+                // Sample ring area (should be mostly white with some dark marks)
+                for (float r = physicalRadius * 0.4f; r < physicalRadius * 0.95f; r += 5)
+                {
+                    int x = (int)(cx + r * cosA);
+                    int y = (int)(cy + r * sinA);
+                    if (x >= 0 && x < source.Width && y >= 0 && y < source.Height)
+                        ringPixels.Add(source.Data[y, x, 0]);
+                }
+            }
+
+            // Calculate adaptive thresholds
+            centerPixels.Sort();
+            ringPixels.Sort();
+
+            byte centerMedian = centerPixels.Count > 0 ? centerPixels[centerPixels.Count / 2] : (byte)50;
+            byte ringBright = ringPixels.Count > 0 ? ringPixels[(int)(ringPixels.Count * 0.75)] : (byte)200;
+
+            // White threshold: 70% of the way from center to ring bright
+            int whiteThreshold = centerMedian + (int)((ringBright - centerMedian) * 0.6);
+            // Dark threshold: 30% of the way from center to ring bright
+            int darkThreshold = centerMedian + (int)((ringBright - centerMedian) * 0.3);
+
+            Log($"  Adaptive thresholds: centerMedian={centerMedian}, ringBright={ringBright}, white>{whiteThreshold}, dark<{darkThreshold}");
 
             var whiteRingStartRadii = new List<float>();
             var whiteRingEndRadii = new List<float>();
@@ -890,7 +933,7 @@ namespace CameraMaui.RingCode
 
                     byte pixel = source.Data[y, x, 0];
 
-                    if (pixel > 180)  // Bright white pixel
+                    if (pixel > whiteThreshold)  // Bright white pixel (adaptive)
                     {
                         consecutiveWhite++;
                         if (!inWhiteRing && consecutiveWhite > 5)
@@ -920,13 +963,13 @@ namespace CameraMaui.RingCode
 
                     byte pixel = source.Data[y, x, 0];
 
-                    if (pixel < 100)  // Dark pixel
+                    if (pixel < darkThreshold)  // Dark pixel (adaptive)
                     {
                         consecutiveDark++;
-                        if (consecutiveDark > 20)
+                        if (consecutiveDark > 15)  // Reduced from 20 for better detection
                         {
                             // This is the outer dark background
-                            whiteEnd = r - 40;
+                            whiteEnd = r - 30;  // Adjusted from -40
                             break;
                         }
                     }
@@ -943,9 +986,11 @@ namespace CameraMaui.RingCode
                 }
             }
 
+            Log($"  Radial scan found {whiteRingStartRadii.Count} valid samples");
+
             // Calculate ring boundaries using median for robustness
             float innerRadius, outerRadius, dataOuterRadius;
-            if (whiteRingStartRadii.Count > 10)
+            if (whiteRingStartRadii.Count >= 8)  // Reduced from 10 for more lenient detection
             {
                 whiteRingStartRadii.Sort();
                 whiteRingEndRadii.Sort();
@@ -960,11 +1005,13 @@ namespace CameraMaui.RingCode
             }
             else
             {
-                // Fallback based on physical radius
-                innerRadius = physicalRadius * 0.40f;
+                // Better fallback: estimate based on typical ring code proportions
+                // Inner radius is typically 40-42% of physical radius
+                // Data outer is typically 97% of physical radius
+                innerRadius = physicalRadius * 0.41f;
                 outerRadius = physicalRadius;
                 dataOuterRadius = physicalRadius * 0.97f;
-                Log($"  White ring scan fallback: inner={innerRadius:F0}, outer={outerRadius:F0}");
+                Log($"  White ring scan FALLBACK ({whiteRingStartRadii.Count} samples): inner={innerRadius:F0}, outer={outerRadius:F0}, dataOuter={dataOuterRadius:F0}");
             }
 
             return (innerRadius, outerRadius, dataOuterRadius);

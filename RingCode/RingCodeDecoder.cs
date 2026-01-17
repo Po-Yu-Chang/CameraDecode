@@ -121,8 +121,10 @@ namespace CameraMaui.RingCode
 
             // Arrow contour for special marking
             public VectorOfPoint ArrowContour { get; set; }
+            public VectorOfPoint ArrowContour2 { get; set; }  // Second contour for Y-shape arrows
             public PointF ArrowTip { get; set; }
             public string ArrowDetectionMethod { get; set; } = "";  // "Template", "Contour", "ContourInv", "Intensity"
+            public bool IsYShapeArrow { get; set; } = false;  // True if arrow detected as Y-shape pair
         }
 
         /// <summary>
@@ -182,6 +184,8 @@ namespace CameraMaui.RingCode
                 if (_lastArrowContour != null)
                 {
                     result.ArrowContour = _lastArrowContour;
+                    result.ArrowContour2 = _lastArrowContour2;  // Second contour for Y-shape
+                    result.IsYShapeArrow = _lastIsYShapeArrow;
                     result.ArrowTip = _lastArrowTip;
                 }
                 long t3 = sw.ElapsedMilliseconds;
@@ -477,19 +481,49 @@ namespace CameraMaui.RingCode
                 maskedAdaptive.Dispose();
             }
 
-            // Step 8: Morphological cleanup
-            var kernel = CvInvoke.GetStructuringElement(ElementShape.Ellipse,
+            // Step 8: Morphological cleanup (like HALCON fill_up + select_shape)
+            // Small kernel for noise removal (OPEN)
+            var kernelSmall = CvInvoke.GetStructuringElement(ElementShape.Ellipse,
                 new System.Drawing.Size(3, 3), new Point(-1, -1));
-            CvInvoke.MorphologyEx(binary, binary, MorphOp.Open, kernel,
+            CvInvoke.MorphologyEx(binary, binary, MorphOp.Open, kernelSmall,
                 new Point(-1, -1), 1, BorderType.Default, new MCvScalar(0));
-            CvInvoke.MorphologyEx(binary, binary, MorphOp.Close, kernel,
-                new Point(-1, -1), 1, BorderType.Default, new MCvScalar(0));
+
+            // Larger kernel for hole filling (CLOSE) - like HALCON fill_up
+            var kernelLarge = CvInvoke.GetStructuringElement(ElementShape.Ellipse,
+                new System.Drawing.Size(7, 7), new Point(-1, -1));
+            CvInvoke.MorphologyEx(binary, binary, MorphOp.Close, kernelLarge,
+                new Point(-1, -1), 2, BorderType.Default, new MCvScalar(0));
 
             // Apply ring mask
-            var foreground = binary.Copy(ringMask);
+            var maskedBinaryTemp = binary.Copy(ringMask);
+
+            // Step 9: Area filtering - remove small noise regions (like HALCON select_shape Area >= 500)
+            int minArea = 500;  // Minimum area threshold from HALCON
+            var foreground = new Image<Gray, byte>(binary.Size);
+            using var contoursFilter = new VectorOfVectorOfPoint();
+            using var hierarchyFilter = new Mat();
+            CvInvoke.FindContours(maskedBinaryTemp.Clone(), contoursFilter, hierarchyFilter,
+                RetrType.External, ChainApproxMethod.ChainApproxSimple);
+
+            int keptCount = 0;
+            int removedCount = 0;
+            for (int i = 0; i < contoursFilter.Size; i++)
+            {
+                double area = CvInvoke.ContourArea(contoursFilter[i]);
+                if (area >= minArea)
+                {
+                    CvInvoke.DrawContours(foreground, contoursFilter, i, new MCvScalar(255), -1);
+                    keptCount++;
+                }
+                else
+                {
+                    removedCount++;
+                }
+            }
 
             int finalWhite = CvInvoke.CountNonZero(foreground);
-            Log($"  Foreground: method={binaryMethod}, whitePixels={finalWhite}");
+            Log($"  Foreground: method={binaryMethod}, whitePixels={finalWhite}, " +
+                $"contours: kept={keptCount}, removed={removedCount} (minArea={minArea})");
 
             // Cleanup
             binaryOtsu.Dispose();
@@ -553,6 +587,8 @@ namespace CameraMaui.RingCode
             InitializeTemplates();
             _lastMatchType = "";
             _lastArrowContour = null;
+            _lastArrowContour2 = null;
+            _lastIsYShapeArrow = false;
             _lastArrowTip = PointF.Empty;
 
             // Method 1 (PRIMARY): Find arrow by analyzing EDGE contours on ORIGINAL image
@@ -833,6 +869,8 @@ namespace CameraMaui.RingCode
 
         // Store last detected arrow contour for visualization
         private VectorOfPoint _lastArrowContour;
+        private VectorOfPoint _lastArrowContour2;  // Second contour for Y-shape
+        private bool _lastIsYShapeArrow;  // Flag to indicate Y-shape detection
         private PointF _lastArrowTip;
 
         /// <summary>
@@ -962,6 +1000,8 @@ namespace CameraMaui.RingCode
         private double FindArrowByContourAnalysis(Image<Gray, byte> foreground, RingImageSegmentation.RingRegion region)
         {
             _lastArrowContour = null;
+            _lastArrowContour2 = null;
+            _lastIsYShapeArrow = false;
             _lastArrowTip = PointF.Empty;
 
             var result = FindArrowByContourAnalysisWithScore(foreground, region);
@@ -1022,7 +1062,14 @@ namespace CameraMaui.RingCode
             float outerR = region.OuterRadius;  // Now correctly set to data ring outer by RingImageSegmentation
             float innerR = region.InnerRadius;  // Now correctly set by radial scan
 
-            Log($"    Ring radii: inner={innerR:F0}, outer={outerR:F0}");
+            Log($"    Ring radii: inner={innerR:F0}, outer={outerR:F0}, ratio={innerR/outerR:F2}");
+            Log($"    Expected: inner ~40% of outer, actual={100*innerR/outerR:F0}%");
+
+            // Sanity check: inner should be ~40-42% of outer for ring codes
+            if (innerR / outerR < 0.35 || innerR / outerR > 0.50)
+            {
+                Log($"    WARNING: Inner/outer ratio {innerR/outerR:F2} outside expected range [0.35-0.50]!");
+            }
 
             // === RING-BASED PREPROCESSING ===
             // Create mask for DATA RING area (where arrow is located)
@@ -1064,16 +1111,16 @@ namespace CameraMaui.RingCode
             var maskedBinary = new Image<Gray, byte>(original.Size);
             CvInvoke.BitwiseAnd(binaryResult, dataMask, maskedBinary);
 
-            // Morphological cleanup
+            // Morphological cleanup - OPEN only (no CLOSE to preserve Y-arrow shape and low solidity)
             var kernel = CvInvoke.GetStructuringElement(ElementShape.Ellipse, new System.Drawing.Size(3, 3), new Point(-1, -1));
             CvInvoke.MorphologyEx(maskedBinary, maskedBinary, MorphOp.Open, kernel, new Point(-1, -1), 1, BorderType.Default, new MCvScalar(0));
-            var largerKernel = CvInvoke.GetStructuringElement(ElementShape.Ellipse, new System.Drawing.Size(5, 5), new Point(-1, -1));
-            CvInvoke.MorphologyEx(maskedBinary, maskedBinary, MorphOp.Close, largerKernel, new Point(-1, -1), 2, BorderType.Default, new MCvScalar(0));
+            // NO CLOSE operation - preserve arrow Y-shape low solidity (matches Test Program)
 
             // Collect candidates from preprocessed binary
+            // contour2 is for Y-shape (both branches), null for single contour
             var allCandidates = new List<(double score, double solidity, double angle, double area,
                 double centroidDistRatio, double tipDistRatio, double elongation, VectorOfPoint contour,
-                PointF centroid, PointF basePoint, bool tipPointsOutward, string method)>();
+                VectorOfPoint contour2, PointF centroid, PointF basePoint, PointF tipPoint, bool tipPointsOutward, string method)>();
 
             using var contours = new VectorOfVectorOfPoint();
             using var hierarchy = new Mat();
@@ -1139,6 +1186,7 @@ namespace CameraMaui.RingCode
                 double elongation = (maxTipDist - minBaseDist) / Math.Sqrt(area);
 
                 // Calculate angle from center to BASE point (closest point) - this is the arrow direction
+                // Use image coordinate convention: Y increases downward, so 0°=right, 90°=down, 180°=left, 270°=up
                 double angle = Math.Atan2(basePoint.Y - cy, basePoint.X - cx) * 180.0 / Math.PI;
                 if (angle < 0) angle += 360;
 
@@ -1178,19 +1226,21 @@ namespace CameraMaui.RingCode
                     score -= areaPenalty;
                 }
 
+                Log($"    Contour {i}: area={area:F0}, solidity={solidity:F3}, centroid={centroidDistRatio:F2}R, tip={tipDistRatio:F2}R, angle={angle:F0}°, shapeMatch={shapeMatchScore:F2}, score={score:F2}");
+
                 if (score > 0.1)
                 {
                     var contourCopy = new VectorOfPoint(contour.ToArray());
                     allCandidates.Add((score, solidity, angle, area, centroidDistRatio, tipDistRatio,
-                        elongation, contourCopy, centroid, basePoint, tipPointsOutward, "Preprocessed"));
+                        elongation, contourCopy, null, centroid, basePoint, tipPoint, tipPointsOutward, "Preprocessed"));
                 }
             }
 
             // === Y-SHAPE DETECTION: Find pairs of nearby contours ===
             // Y-shaped arrow may be split into two branches - detect by finding adjacent pairs
-            // STRICT CONDITIONS to avoid false positives
+            // Relaxed conditions to handle various arrow shapes
             var yShapeCandidates = new List<(double score, double angle, double combinedArea,
-                VectorOfPoint contour1, VectorOfPoint contour2, PointF basePoint)>();
+                VectorOfPoint contour1, VectorOfPoint contour2, PointF basePoint, PointF tipPoint)>();
 
             for (int i = 0; i < allCandidates.Count; i++)
             {
@@ -1200,35 +1250,38 @@ namespace CameraMaui.RingCode
                     var c2 = allCandidates[j];
 
                     // Both contours must have reasonably HIGH solidity (individual branches are solid)
-                    if (c1.solidity < 0.82 || c2.solidity < 0.82) continue;
+                    if (c1.solidity < 0.80 || c2.solidity < 0.80) continue;
 
-                    // STRICT: Both should have similar area (arrow branches are symmetric)
+                    // Both should have similar area (arrow branches are roughly symmetric)
                     double areaRatio = Math.Min(c1.area, c2.area) / Math.Max(c1.area, c2.area);
-                    if (areaRatio < 0.4) continue;
+                    if (areaRatio < 0.35) continue;
 
                     // Both should be reasonably small (arrow branches are medium sized)
-                    double maxBranchArea = outerR * outerR * 0.06;  // Each branch < 6% of ring
+                    double maxBranchArea = outerR * outerR * 0.07;  // Each branch < 7% of ring
                     if (c1.area > maxBranchArea || c2.area > maxBranchArea) continue;
 
-                    // Check angle difference (Y-shape branches are ~15-22° apart)
-                    // STRICT: Narrower range to avoid false positives from adjacent data marks
+                    // Check angle difference (Y-shape branches are ~15-30° apart)
+                    // Expanded range to catch various Y-arrow orientations
                     double angleDiff = Math.Abs(c1.angle - c2.angle);
                     if (angleDiff > 180) angleDiff = 360 - angleDiff;
 
-                    if (angleDiff >= 15 && angleDiff <= 24)
+                    if (angleDiff >= 15 && angleDiff <= 26)  // Optimized range
                     {
-                        // Check if both are at similar distance from center (within 0.15R - STRICT)
-                        // Real Y-arrow branches are at SAME distance, data marks are scattered
+                        // Check if both are at similar distance from center
+                        // Y-shape may have one branch pointing outward (tip) and one inward
                         double distDiff = Math.Abs(c1.centroidDistRatio - c2.centroidDistRatio);
-                        if (distDiff > 0.15) continue;
+                        if (distDiff > 0.25) continue;
 
-                        // BOTH branches must be in inner-middle position (0.55-0.78R)
-                        // Data marks at outer ring (0.80R+) should NOT be matched as Y-pair
-                        if (c1.centroidDistRatio < 0.55 || c1.centroidDistRatio > 0.78) continue;
-                        if (c2.centroidDistRatio < 0.55 || c2.centroidDistRatio > 0.78) continue;
+                        // Average centroid should be reasonable (0.58-0.80R)
+                        double avgDist = (c1.centroidDistRatio + c2.centroidDistRatio) / 2;
+                        if (avgDist < 0.58 || avgDist > 0.80) continue;
 
-                        // STRICT: If BOTH branches have high solidity (>0.92), it's likely data marks
-                        // Real arrow branches have lower solidity due to Y-shape gaps
+                        // Both must be within wider range (0.50-0.90R)
+                        if (c1.centroidDistRatio < 0.50 || c1.centroidDistRatio > 0.90) continue;
+                        if (c2.centroidDistRatio < 0.50 || c2.centroidDistRatio > 0.90) continue;
+
+                        // Skip if BOTH branches have high solidity (>0.92), likely data marks not arrow
+                        // Y-shape arrow branches should have moderate solidity (0.6-0.90)
                         if (c1.solidity > 0.92 && c2.solidity > 0.92) continue;
 
                         double avgCentroidDist = (c1.centroidDistRatio + c2.centroidDistRatio) / 2;
@@ -1243,34 +1296,37 @@ namespace CameraMaui.RingCode
                         if (Math.Abs(c1.angle - c2.angle) > 180)
                             avgAngle = (avgAngle + 180) % 360;
 
-                        // Y-shape score - lower base score so shape-matched single contours can win
-                        double pairScore = 0.85;  // Lower to let shape match compete
-                        if (angleDiff >= 17 && angleDiff <= 21) pairScore += 0.08;  // Ideal angle ~18-20°
-                        if (avgCentroidDist >= 0.62 && avgCentroidDist <= 0.70) pairScore += 0.05;
+                        // Y-shape score - HIGH base score because Y-pair detection is reliable
+                        // Y-pair matching (two branches at 15-26° apart) is more specific than single contour
+                        double pairScore = 0.98;  // High base - Y-pair is reliable
+                        if (angleDiff >= 17 && angleDiff <= 21) pairScore += 0.02;  // Ideal angle ~18-20°
+                        if (avgCentroidDist >= 0.62 && avgCentroidDist <= 0.70) pairScore += 0.01;
 
                         // Use midpoint as base
                         var midBase = new PointF(
                             (c1.basePoint.X + c2.basePoint.X) / 2,
                             (c1.basePoint.Y + c2.basePoint.Y) / 2);
 
+                        // Use midpoint of both branch's actual tipPoints (furthest from center)
+                        var yShapeTipPoint = new PointF(
+                            (c1.tipPoint.X + c2.tipPoint.X) / 2,
+                            (c1.tipPoint.Y + c2.tipPoint.Y) / 2);
+
                         Log($"    Y-pair: {c1.angle:F0}° + {c2.angle:F0}° = {avgAngle:F0}°, " +
                             $"diff={angleDiff:F0}°, dist={avgCentroidDist:F2}R, score={pairScore:F2}");
 
                         yShapeCandidates.Add((pairScore, avgAngle, combinedArea,
-                            c1.contour, c2.contour, midBase));
+                            c1.contour, c2.contour, midBase, yShapeTipPoint));
                     }
                 }
             }
 
-            // Only add Y-shape if it scores higher than best single contour
-            var bestSingleScore = allCandidates.Count > 0 ? allCandidates.Max(c => c.score) : 0;
+            // Always add Y-shape pairs - they have high reliability (synced with TestArrowDetection)
             foreach (var yc in yShapeCandidates)
             {
-                if (yc.score > bestSingleScore)
-                {
-                    allCandidates.Add((yc.score, 0.5, yc.angle, yc.combinedArea, 0.7, 0.85,
-                        1.5, yc.contour1, new PointF(0, 0), yc.basePoint, true, "Y-Shape"));
-                }
+                // Use yc.tipPoint (calculated at outer radius in avgAngle direction) for correct visualization
+                allCandidates.Add((yc.score, 0.5, yc.angle, yc.combinedArea, 0.7, 0.85,
+                    1.5, yc.contour1, yc.contour2, new PointF(0, 0), yc.basePoint, yc.tipPoint, true, "Y-Shape"));
             }
 
             // Cleanup
@@ -1280,7 +1336,6 @@ namespace CameraMaui.RingCode
             binaryResult.Dispose();
             maskedBinary.Dispose();
             kernel.Dispose();
-            largerKernel.Dispose();
 
             Log($"    Found {allCandidates.Count} arrow candidates");
 
@@ -1305,9 +1360,11 @@ namespace CameraMaui.RingCode
                     double snappedAngle = sector * 15.0;
 
                     _lastArrowContour = best.contour;
-                    _lastArrowTip = best.basePoint;  // Store base point for visualization
+                    _lastArrowContour2 = best.contour2;  // Store second contour for Y-shape
+                    _lastIsYShapeArrow = best.contour2 != null;  // Flag if Y-shape
+                    _lastArrowTip = best.tipPoint;  // Store TIP point (furthest from center) for visualization
 
-                    Log($"  Arrow found: score={best.score:F2}, angle={best.angle:F1}° -> sector {sector} ({snappedAngle}°)");
+                    Log($"  Arrow found: score={best.score:F2}, angle={best.angle:F1}° -> sector {sector} ({snappedAngle}°), isYShape={_lastIsYShapeArrow}");
                     return snappedAngle;
                 }
             }
@@ -2365,19 +2422,54 @@ namespace CameraMaui.RingCode
                     }
                 }
 
-                // *** SPECIAL ARROW MARKING - Draw arrow with FILLED RED color ***
+                // *** SPECIAL ARROW MARKING - Different colors for Y-shape vs single contour ***
                 if (result.ArrowContour != null && result.ArrowContour.Size > 0)
                 {
-                    using var arrowContourVector = new VectorOfVectorOfPoint();
-                    arrowContourVector.Push(result.ArrowContour);
+                    if (result.IsYShapeArrow && result.ArrowContour2 != null && result.ArrowContour2.Size > 0)
+                    {
+                        // Y-SHAPE: Draw both branches in distinct colors (GREEN and CYAN)
+                        using var contour1Vector = new VectorOfVectorOfPoint();
+                        using var contour2Vector = new VectorOfVectorOfPoint();
+                        contour1Vector.Push(result.ArrowContour);
+                        contour2Vector.Push(result.ArrowContour2);
 
-                    // Draw filled red arrow
-                    CvInvoke.DrawContours(visualization, arrowContourVector, 0, new MCvScalar(0, 0, 255), -1);  // -1 = filled
+                        // Branch 1: GREEN filled
+                        CvInvoke.DrawContours(visualization, contour1Vector, 0, new MCvScalar(0, 255, 0), -1);  // Filled green
+                        CvInvoke.DrawContours(visualization, contour1Vector, 0, new MCvScalar(0, 180, 0), 3);   // Dark green outline
 
-                    // Draw thick red outline
-                    CvInvoke.DrawContours(visualization, arrowContourVector, 0, new MCvScalar(0, 0, 200), 3);
+                        // Branch 2: CYAN filled
+                        CvInvoke.DrawContours(visualization, contour2Vector, 0, new MCvScalar(255, 255, 0), -1);  // Filled cyan
+                        CvInvoke.DrawContours(visualization, contour2Vector, 0, new MCvScalar(180, 180, 0), 3);   // Dark cyan outline
 
-                    // Draw arrow tip marker
+                        // Labels for Y-shape branches
+                        var m1 = CvInvoke.Moments(result.ArrowContour);
+                        var m2 = CvInvoke.Moments(result.ArrowContour2);
+                        if (m1.M00 > 0 && m2.M00 > 0)
+                        {
+                            int x1 = (int)(m1.M10 / m1.M00);
+                            int y1 = (int)(m1.M01 / m1.M00);
+                            int x2 = (int)(m2.M10 / m2.M00);
+                            int y2 = (int)(m2.M01 / m2.M00);
+                            CvInvoke.PutText(visualization, "Y-1", new Point(x1 - 15, y1 - 8),
+                                FontFace.HersheySimplex, 0.4, new MCvScalar(0, 255, 0), 2);
+                            CvInvoke.PutText(visualization, "Y-2", new Point(x2 - 15, y2 - 8),
+                                FontFace.HersheySimplex, 0.4, new MCvScalar(255, 255, 0), 2);
+                        }
+                    }
+                    else
+                    {
+                        // SINGLE CONTOUR: Draw in RED (original behavior)
+                        using var arrowContourVector = new VectorOfVectorOfPoint();
+                        arrowContourVector.Push(result.ArrowContour);
+
+                        // Draw filled red arrow
+                        CvInvoke.DrawContours(visualization, arrowContourVector, 0, new MCvScalar(0, 0, 255), -1);  // -1 = filled
+
+                        // Draw thick red outline
+                        CvInvoke.DrawContours(visualization, arrowContourVector, 0, new MCvScalar(0, 0, 200), 3);
+                    }
+
+                    // Draw arrow tip marker (for both Y-shape and single)
                     if (result.ArrowTip != PointF.Empty)
                     {
                         CvInvoke.Circle(visualization, Point.Round(result.ArrowTip), 5, new MCvScalar(255, 255, 0), -1);  // Yellow dot
@@ -2467,23 +2559,35 @@ namespace CameraMaui.RingCode
                     }
                 }
 
-                // *** MAIN ARROW INDICATOR - THICK MAGENTA line showing detected arrow angle ***
+                // *** MAIN ARROW INDICATOR - Draw line from CENTER to ARROW TIP ***
                 {
-                    double arrowAngleRad = result.RotationAngle * Math.PI / 180;
-                    int arrowX = (int)(result.Center.X + result.OuterRadius * 1.1 * Math.Cos(arrowAngleRad));
-                    int arrowY = (int)(result.Center.Y + result.OuterRadius * 1.1 * Math.Sin(arrowAngleRad));
-
-                    // Draw thick magenta arrow showing detected arrow direction
                     var arrowColor = new MCvScalar(255, 0, 255);  // Magenta (BGR)
-                    CvInvoke.ArrowedLine(visualization, Point.Round(result.Center), new Point(arrowX, arrowY),
+                    Point arrowEndPoint;
+
+                    // Use actual arrow tip point if available
+                    if (result.ArrowTip != PointF.Empty)
+                    {
+                        arrowEndPoint = Point.Round(result.ArrowTip);
+                    }
+                    else
+                    {
+                        // Fallback: calculate from angle
+                        double arrowAngleRad = result.RotationAngle * Math.PI / 180;
+                        arrowEndPoint = new Point(
+                            (int)(result.Center.X + result.OuterRadius * 1.1 * Math.Cos(arrowAngleRad)),
+                            (int)(result.Center.Y + result.OuterRadius * 1.1 * Math.Sin(arrowAngleRad)));
+                    }
+
+                    // Draw thick magenta line from center to arrow tip
+                    CvInvoke.ArrowedLine(visualization, Point.Round(result.Center), arrowEndPoint,
                         arrowColor, 4, LineType.AntiAlias, 0, 0.2);
 
-                    // Draw circle at arrow endpoint
-                    CvInvoke.Circle(visualization, new Point(arrowX, arrowY), 10, arrowColor, 3);
+                    // Draw circle at arrow tip
+                    CvInvoke.Circle(visualization, arrowEndPoint, 10, arrowColor, 3);
 
                     // Label showing angle
                     CvInvoke.PutText(visualization, $"Arrow: {result.RotationAngle:F1}°",
-                        new Point(arrowX - 40, arrowY + 25),
+                        new Point(arrowEndPoint.X - 40, arrowEndPoint.Y + 25),
                         FontFace.HersheySimplex, 0.4, arrowColor, 1);
                 }
 
@@ -2571,6 +2675,155 @@ namespace CameraMaui.RingCode
         }
 
         /// <summary>
+        /// Create a ROTATED main visualization with arrow pointing right
+        /// Similar to HALCON's output - the main image shows the ring rotated so arrow is at 3 o'clock
+        /// Includes foreground region overlay for debugging
+        /// </summary>
+        public Image<Bgr, byte> CreateRotatedMainVisualization(Image<Bgr, byte> source, RingCodeResult result, int outputSize = 400)
+        {
+            if (result.OuterRadius < 10) return source.Clone();
+
+            try
+            {
+                // Extract ring region with margin
+                int margin = (int)(result.OuterRadius * 1.3);
+                int x = Math.Max(0, (int)(result.Center.X - margin));
+                int y = Math.Max(0, (int)(result.Center.Y - margin));
+                int w = Math.Min(margin * 2, source.Width - x);
+                int h = Math.Min(margin * 2, source.Height - y);
+
+                if (w <= 0 || h <= 0) return source.Clone();
+
+                source.ROI = new Rectangle(x, y, w, h);
+                var cropped = source.Clone();
+                source.ROI = Rectangle.Empty;
+
+                // Calculate actual arrow angle from center to arrow tip
+                double actualArrowAngle;
+                if (result.ArrowTip != PointF.Empty)
+                {
+                    actualArrowAngle = Math.Atan2(result.ArrowTip.Y - result.Center.Y,
+                                                   result.ArrowTip.X - result.Center.X) * 180.0 / Math.PI;
+                }
+                else
+                {
+                    actualArrowAngle = result.RotationAngle;
+                }
+
+                // Calculate ring center position in CROPPED image coordinates
+                float ringCenterInCroppedX = (float)(result.Center.X - x);
+                float ringCenterInCroppedY = (float)(result.Center.Y - y);
+
+                // Rotate to make arrow point right (0 degrees)
+                double rotationNeeded = actualArrowAngle;
+                var rotationMat = new Mat();
+                CvInvoke.GetRotationMatrix2D(new PointF(ringCenterInCroppedX, ringCenterInCroppedY), rotationNeeded, 1.0, rotationMat);
+
+                var rotated = new Image<Bgr, byte>(cropped.Size);
+                CvInvoke.WarpAffine(cropped, rotated, rotationMat, cropped.Size);
+
+                // Also rotate the foreground mask if available
+                Image<Gray, byte> rotatedForeground = null;
+                if (result.ForegroundMask != null)
+                {
+                    // Crop foreground mask to same ROI
+                    result.ForegroundMask.ROI = new Rectangle(x, y, w, h);
+                    var croppedForeground = result.ForegroundMask.Clone();
+                    result.ForegroundMask.ROI = Rectangle.Empty;
+
+                    // Rotate foreground mask
+                    rotatedForeground = new Image<Gray, byte>(croppedForeground.Size);
+                    CvInvoke.WarpAffine(croppedForeground, rotatedForeground, rotationMat, croppedForeground.Size);
+                }
+
+                // Resize to output size
+                var output = new Image<Bgr, byte>(outputSize, outputSize);
+                CvInvoke.Resize(rotated, output, new System.Drawing.Size(outputSize, outputSize));
+
+                // Resize rotated foreground and overlay
+                if (rotatedForeground != null)
+                {
+                    var scaledForeground = new Image<Gray, byte>(outputSize, outputSize);
+                    CvInvoke.Resize(rotatedForeground, scaledForeground, new System.Drawing.Size(outputSize, outputSize));
+
+                    // Overlay foreground region with semi-transparent RED color
+                    for (int py = 0; py < outputSize; py++)
+                    {
+                        for (int px = 0; px < outputSize; px++)
+                        {
+                            if (scaledForeground.Data[py, px, 0] > 128)
+                            {
+                                // Blend with red color (50% opacity)
+                                output.Data[py, px, 0] = (byte)((output.Data[py, px, 0] + 0) / 2);     // B
+                                output.Data[py, px, 1] = (byte)((output.Data[py, px, 1] + 0) / 2);     // G
+                                output.Data[py, px, 2] = (byte)((output.Data[py, px, 2] + 255) / 2);   // R
+                            }
+                        }
+                    }
+                    scaledForeground.Dispose();
+                }
+
+                // Calculate scale factor for drawing
+                float scale = outputSize / (float)(margin * 2);
+                int cx = outputSize / 2;
+                int cy = outputSize / 2;
+                float scaledOuterR = result.OuterRadius * scale;
+                float scaledInnerR = result.InnerRadius * scale;
+                float scaledMiddleR = result.MiddleRadius * scale;
+
+                // Draw circles
+                var mainColor = result.IsValid ? new MCvScalar(0, 255, 0) : new MCvScalar(0, 0, 255);
+                CvInvoke.Circle(output, new Point(cx, cy), (int)scaledOuterR, mainColor, 2);
+                CvInvoke.Circle(output, new Point(cx, cy), (int)scaledMiddleR, mainColor, 1);
+                CvInvoke.Circle(output, new Point(cx, cy), (int)scaledInnerR, mainColor, 2);
+
+                // Draw center point
+                CvInvoke.Circle(output, new Point(cx, cy), 4, new MCvScalar(0, 255, 0), -1);
+
+                // Draw 24 segment lines (starting from arrow at 0°)
+                var lineColor = new MCvScalar(0, 255, 0);
+                for (int i = 0; i < SEGMENTS; i++)
+                {
+                    double angle = (i * SEGMENT_ANGLE - SEGMENT_ANGLE) * Math.PI / 180;  // Start at -15°
+                    int x1 = (int)(cx + scaledInnerR * 0.9 * Math.Cos(angle));
+                    int y1 = (int)(cy + scaledInnerR * 0.9 * Math.Sin(angle));
+                    int x2 = (int)(cx + scaledOuterR * Math.Cos(angle));
+                    int y2 = (int)(cy + scaledOuterR * Math.Sin(angle));
+                    CvInvoke.Line(output, new Point(x1, y1), new Point(x2, y2), lineColor, 1);
+                }
+
+                // Draw arrow indicator pointing RIGHT (at 0°)
+                var arrowColor = new MCvScalar(0, 255, 255);  // Yellow
+                int arrowX = (int)(cx + scaledOuterR * 0.85);
+                CvInvoke.ArrowedLine(output, new Point(cx, cy), new Point(arrowX, cy),
+                    arrowColor, 3, LineType.AntiAlias, 0, 0.2);
+
+                // Add decoded data text
+                string dataText = result.IsValid ? result.DecodedData : "Invalid";
+                CvInvoke.PutText(output, dataText, new Point(10, 25),
+                    FontFace.HersheySimplex, 0.6, mainColor, 2);
+
+                // Add binary string (if valid)
+                if (result.IsValid && !string.IsNullOrEmpty(result.BinaryString))
+                {
+                    CvInvoke.PutText(output, result.BinaryString.Substring(0, Math.Min(24, result.BinaryString.Length)),
+                        new Point(10, outputSize - 35), FontFace.HersheySimplex, 0.35, new MCvScalar(255, 255, 255), 1);
+                    if (result.BinaryString.Length > 24)
+                    {
+                        CvInvoke.PutText(output, result.BinaryString.Substring(24),
+                            new Point(10, outputSize - 15), FontFace.HersheySimplex, 0.35, new MCvScalar(255, 255, 255), 1);
+                    }
+                }
+
+                return output;
+            }
+            catch
+            {
+                return source.Clone();
+            }
+        }
+
+        /// <summary>
         /// Create a rotated thumbnail of the ring code with arrow pointing right
         /// Similar to HALCON's Affine_Trans_CorrectPosition
         /// </summary>
@@ -2593,16 +2846,31 @@ namespace CameraMaui.RingCode
                 var cropped = source.Clone();
                 source.ROI = Rectangle.Empty;
 
+                // Calculate actual arrow angle from center to arrow tip
+                double actualArrowAngle;
+                if (result.ArrowTip != PointF.Empty)
+                {
+                    // Use actual arrow tip position
+                    actualArrowAngle = Math.Atan2(result.ArrowTip.Y - result.Center.Y,
+                                                   result.ArrowTip.X - result.Center.X) * 180.0 / Math.PI;
+                }
+                else
+                {
+                    // Fallback to rotation angle
+                    actualArrowAngle = result.RotationAngle;
+                }
+
                 // Calculate rotation angle to make arrow point right (0 degrees)
-                // Arrow is at RotationAngle, we want it at 0
-                double rotationNeeded = -result.RotationAngle;
+                // If arrow is at angle θ, rotate image by +θ to bring arrow to 0°
+                double rotationNeeded = actualArrowAngle;
 
-                // Rotate around center
-                float cx = cropped.Width / 2f;
-                float cy = cropped.Height / 2f;
+                // Calculate ring center position in CROPPED image coordinates
+                float ringCenterInCroppedX = (float)(result.Center.X - x);
+                float ringCenterInCroppedY = (float)(result.Center.Y - y);
 
+                // Rotate around the ACTUAL ring center (not image center)
                 var rotationMat = new Mat();
-                CvInvoke.GetRotationMatrix2D(new PointF(cx, cy), rotationNeeded, 1.0, rotationMat);
+                CvInvoke.GetRotationMatrix2D(new PointF(ringCenterInCroppedX, ringCenterInCroppedY), rotationNeeded, 1.0, rotationMat);
 
                 var rotated = new Image<Bgr, byte>(cropped.Size);
                 CvInvoke.WarpAffine(cropped, rotated, rotationMat, cropped.Size);

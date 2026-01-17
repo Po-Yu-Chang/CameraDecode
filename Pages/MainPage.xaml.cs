@@ -639,8 +639,20 @@ namespace CameraMaui.Pages
                             lblDetails.Text = $"Total: {allResults.Count} rings, Valid: {validCount}, Invalid: {invalidCount}";
                         }
 
-                        // Create and display combined visualization
-                        var visualization = _ringCodeDecoder.CreateCombinedVisualization(_currentEmguImage.Clone(), allResults);
+                        // Create and display visualization
+                        // Use rotated main visualization (arrow pointing right) for single ring
+                        // Use combined visualization for multiple rings
+                        Image<Bgr, byte> visualization;
+                        if (allResults.Count == 1)
+                        {
+                            // Single ring: show rotated view with arrow pointing right (HALCON style)
+                            visualization = _ringCodeDecoder.CreateRotatedMainVisualization(_currentEmguImage.Clone(), allResults[0], 500);
+                        }
+                        else
+                        {
+                            // Multiple rings: show combined view on original image
+                            visualization = _ringCodeDecoder.CreateCombinedVisualization(_currentEmguImage.Clone(), allResults);
+                        }
                         var processedSKBitmap = ConvertEmguImageToSKBitmap(visualization);
                         processedImage.Source = ConvertSkBitmapToImageSource(processedSKBitmap);
 

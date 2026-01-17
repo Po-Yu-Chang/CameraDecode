@@ -322,7 +322,7 @@ class Program
 
         // Find contours from preprocessed binary
         var allCandidates = new List<(double score, double solidity, double angle, double area,
-            double centroidDist, double tipDist, VectorOfPoint contour, PointF basePoint, string method)>();
+            double centroidDist, double tipDist, VectorOfPoint contour, PointF basePoint, PointF tipPoint, string method)>();
 
         using var contours = new VectorOfVectorOfPoint();
         using var hierarchy = new Mat();
@@ -380,6 +380,7 @@ class Program
             double solidity = hullArea > 0 ? area / hullArea : 1.0;
 
             // Calculate angle from center to BASE (closest point) - this is the arrow direction
+            // Use image coordinate convention: Y increases downward, so 0°=right, 90°=down, 180°=left, 270°=up
             double angle = Math.Atan2(basePoint.Y - cy, basePoint.X - cx) * 180 / Math.PI;
             if (angle < 0) angle += 360;
 
@@ -487,7 +488,7 @@ class Program
             {
                 var contourCopy = new VectorOfPoint(contour.ToArray());
                 allCandidates.Add((score, solidity, angle, area, centroidDistRatio, tipDistRatio,
-                    contourCopy, basePoint, "Preprocessed"));
+                    contourCopy, basePoint, tip, "Preprocessed"));
             }
         }
 
@@ -496,7 +497,7 @@ class Program
         // STRICT CONDITIONS to avoid false positives
         Console.WriteLine($"\n=== Y-SHAPE PAIR DETECTION ===");
         var yShapeCandidates = new List<(double score, double angle, double combinedArea,
-            VectorOfPoint contour1, VectorOfPoint contour2, PointF basePoint)>();
+            VectorOfPoint contour1, VectorOfPoint contour2, PointF basePoint, PointF tipPoint)>();
 
         for (int i = 0; i < allCandidates.Count; i++)
         {
@@ -522,20 +523,24 @@ class Program
                 double angleDiff = Math.Abs(c1.angle - c2.angle);
                 if (angleDiff > 180) angleDiff = 360 - angleDiff;
 
-                if (angleDiff >= 15 && angleDiff <= 24)
+                if (angleDiff >= 15 && angleDiff <= 26)  // Slightly relaxed angle range
                 {
-                    // Check if both are at similar distance from center (within 0.15R - STRICT)
-                    // Real Y-arrow branches are at SAME distance, data marks are scattered
+                    // Check if both are at similar distance from center
+                    // Y-shape may have one branch pointing outward (tip) and one inward
                     double distDiff = Math.Abs(c1.centroidDist - c2.centroidDist);
-                    if (distDiff > 0.15) continue;  // Branches must be at very similar distance
+                    if (distDiff > 0.25) continue;  // Allow some difference for Y-shape asymmetry
 
-                    // BOTH branches must be in inner-middle position (0.55-0.78R)
-                    // Data marks at outer ring (0.80R+) should NOT be matched as Y-pair
-                    if (c1.centroidDist < 0.55 || c1.centroidDist > 0.78) continue;
-                    if (c2.centroidDist < 0.55 || c2.centroidDist > 0.78) continue;
+                    // At least one branch must be in the data ring area (0.55-0.85R)
+                    // And the AVERAGE should be reasonable (0.58-0.80R)
+                    double avgDist = (c1.centroidDist + c2.centroidDist) / 2;
+                    if (avgDist < 0.58 || avgDist > 0.80) continue;
 
-                    // STRICT: If BOTH branches have high solidity (>0.92), it's likely data marks
-                    // Real arrow branches have lower solidity due to Y-shape gaps
+                    // Both must be within wider range (0.50-0.90R)
+                    if (c1.centroidDist < 0.50 || c1.centroidDist > 0.90) continue;
+                    if (c2.centroidDist < 0.50 || c2.centroidDist > 0.90) continue;
+
+                    // STRICT: If BOTH branches have high solidity (>0.92), likely data marks not arrow
+                    // Y-shape arrow branches should have moderate solidity (0.6-0.90)
                     if (c1.solidity > 0.92 && c2.solidity > 0.92) continue;
 
                     {
@@ -551,21 +556,29 @@ class Program
                         if (Math.Abs(c1.angle - c2.angle) > 180)
                             avgAngle = (avgAngle + 180) % 360;
 
-                        // Y-shape score - lower base score so shape-matched single contours can win
-                        double pairScore = 0.85;  // Lower to let shape match compete
-                        if (angleDiff >= 17 && angleDiff <= 21) pairScore += 0.08;  // Ideal angle ~18-20°
-                        if (avgCentroidDist >= 0.62 && avgCentroidDist <= 0.70) pairScore += 0.05;
+                        // Y-shape score - HIGH base score because Y-pair detection is reliable
+                        // Y-pair matching (two branches at 15-26° apart) is more specific than single contour
+                        double pairScore = 0.98;  // High base - Y-pair is reliable
+                        if (angleDiff >= 17 && angleDiff <= 21) pairScore += 0.02;  // Ideal angle ~18-20°
+                        if (avgCentroidDist >= 0.62 && avgCentroidDist <= 0.70) pairScore += 0.01;
 
                         // Use midpoint as base
                         var midBase = new PointF(
                             (c1.basePoint.X + c2.basePoint.X) / 2,
                             (c1.basePoint.Y + c2.basePoint.Y) / 2);
 
+                        // Use midpoint of both branch's actual tipPoints (furthest from center)
+                        var yTipPoint = new PointF(
+                            (c1.tipPoint.X + c2.tipPoint.X) / 2,
+                            (c1.tipPoint.Y + c2.tipPoint.Y) / 2);
+
                         Console.WriteLine($"  Y-pair: {c1.angle:F0}° + {c2.angle:F0}° = {avgAngle:F0}°, " +
                             $"diff={angleDiff:F0}°, dist={avgCentroidDist:F2}R, score={pairScore:F2}");
+                        Console.WriteLine($"    c1.basePoint=({c1.basePoint.X:F0},{c1.basePoint.Y:F0}), c2.basePoint=({c2.basePoint.X:F0},{c2.basePoint.Y:F0})");
+                        Console.WriteLine($"    midBase=({midBase.X:F0},{midBase.Y:F0}), center=({cx},{cy})");
 
                         yShapeCandidates.Add((pairScore, avgAngle, combinedArea,
-                            c1.contour, c2.contour, midBase));
+                            c1.contour, c2.contour, midBase, yTipPoint));
                     }
                 }
             }
@@ -575,7 +588,7 @@ class Program
         foreach (var yc in yShapeCandidates)
         {
             allCandidates.Add((yc.score, 0.5, yc.angle, yc.combinedArea, 0.7, 0.85,
-                yc.contour1, yc.basePoint, "Y-Shape"));
+                yc.contour1, yc.basePoint, yc.tipPoint, "Y-Shape"));
         }
 
         // Sort and display results
@@ -624,13 +637,21 @@ class Program
 
             Console.WriteLine($"\n=== DETECTED ARROW: {best.angle:F1}° -> sector {sector} ({snappedAngle}°) ===");
 
-            // Draw final arrow direction - from center through base point, extending outward
-            // Use the actual base point direction (not snapped)
-            double rad = best.angle * Math.PI / 180;
-            int lineEndX = (int)(cx + outerR * 1.3 * Math.Cos(rad));
-            int lineEndY = (int)(cy + outerR * 1.3 * Math.Sin(rad));
-            CvInvoke.ArrowedLine(resultImage, new Point(cx, cy), new Point(lineEndX, lineEndY),
+            // Draw line from CENTER through BASEPOINT (closest to center) extended to outer edge
+            // This shows the arrow direction - the arrow points toward center from basePoint
+            double dirAngle = Math.Atan2(best.basePoint.Y - cy, best.basePoint.X - cx);
+            double dirAngleDeg = dirAngle * 180 / Math.PI;
+            if (dirAngleDeg < 0) dirAngleDeg += 360;
+            int endX = cx + (int)(outerR * 1.1 * Math.Cos(dirAngle));
+            int endY = cy + (int)(outerR * 1.1 * Math.Sin(dirAngle));
+            Console.WriteLine($"  Drawing: basePoint=({best.basePoint.X:F0},{best.basePoint.Y:F0}), dirAngle={dirAngleDeg:F1}°, endpoint=({endX},{endY})");
+            CvInvoke.ArrowedLine(resultImage, new Point(cx, cy), new Point(endX, endY),
                 new MCvScalar(0, 255, 0), 3);
+
+            // Mark the basePoint with a circle
+            Point basePt = Point.Round(best.basePoint);
+            CvInvoke.Circle(resultImage, basePt, 8, new MCvScalar(0, 255, 255), -1);  // Yellow filled
+            CvInvoke.Circle(resultImage, basePt, 8, new MCvScalar(0, 0, 0), 2);  // Black outline
 
             // Add text
             CvInvoke.PutText(resultImage, $"Arrow: {snappedAngle}deg", new Point(10, 30),

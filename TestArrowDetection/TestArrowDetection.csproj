@@ -13,4 +13,8 @@
     <PackageReference Include="Emgu.CV" Version="4.9.0.5494" />
     <PackageReference Include="Emgu.CV.runtime.windows" Version="4.9.0.5494" />
   </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\RingCode\RingImageSegmentation.cs" Link="RingImageSegmentation.cs" />
+  </ItemGroup>
 </Project>

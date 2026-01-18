@@ -58,6 +58,12 @@ namespace CameraMaui.Pages
             _ringCodeDecoder.InitializeTemplates();
             Log($"Templates loaded - Dark: {_ringCodeDecoder.HasDarkTemplate}, Light: {_ringCodeDecoder.HasLightTemplate}");
 
+            // Enable debug output for arrow detection - saves to Desktop
+            RingCodeDecoder.DebugOutputDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
+                "ArrowDebug");
+            Log($"Arrow debug output enabled: {RingCodeDecoder.DebugOutputDir}");
+
             // Test orientation service
             var orientation = _deviceOrientationService?.GetOrentation() ?? DeviceOrientation.Undefined;
             System.Diagnostics.Debug.WriteLine($"Device Orientation: {orientation}");

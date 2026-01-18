@@ -1,3 +1,4 @@
+#if ANDROID || WINDOWS
 using Emgu.CV;
 using Emgu.CV.CvEnum;
 using Emgu.CV.Structure;
@@ -26,6 +27,9 @@ namespace CameraMaui.RingCode
         public static Action<string> Log { get; set; } = (msg) => System.Diagnostics.Debug.WriteLine($"[Decoder] {msg}");
         public static bool EnableDetailedLog { get; set; } = false;  // Disabled for performance
 
+        // Debug output - set to a valid directory path to save arrow detection debug images
+        public static string DebugOutputDir { get; set; } = null;
+
         // Arrow template matchers
         private ArrowTemplateMatcher _darkTemplateMatcher;
         private ArrowTemplateMatcher _lightTemplateMatcher;
@@ -34,30 +38,111 @@ namespace CameraMaui.RingCode
         /// <summary>
         /// Initialize arrow template matchers from default paths
         /// </summary>
+        // Cached template paths (found once, reused)
+        private static string _cachedDarkTemplatePath = null;
+        private static string _cachedLightTemplatePath = null;
+        private static bool _templatePathsSearched = false;
+
         public void InitializeTemplates()
         {
             if (_templatesInitialized) return;
 
-            var appData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            var darkPath = Path.Combine(appData, "arrow_template_dark.png");
-            var lightPath = Path.Combine(appData, "arrow_template_light.png");
-
             _darkTemplateMatcher = new ArrowTemplateMatcher();
             _lightTemplateMatcher = new ArrowTemplateMatcher();
 
-            if (File.Exists(darkPath))
+            // Only search for paths once (static cache)
+            if (!_templatePathsSearched)
             {
-                _darkTemplateMatcher.LoadTemplate(darkPath);
-                Log($"Dark template loaded from {darkPath}");
+                _templatePathsSearched = true;
+                FindTemplatePaths();
             }
 
-            if (File.Exists(lightPath))
+            if (_cachedDarkTemplatePath != null)
             {
-                _lightTemplateMatcher.LoadTemplate(lightPath);
-                Log($"Light template loaded from {lightPath}");
+                _darkTemplateMatcher.LoadTemplate(_cachedDarkTemplatePath);
+                Log($"[Template] Dark loaded: {_darkTemplateMatcher.Template?.Width}x{_darkTemplateMatcher.Template?.Height}");
+            }
+
+            if (_cachedLightTemplatePath != null)
+            {
+                _lightTemplateMatcher.LoadTemplate(_cachedLightTemplatePath);
+                Log($"[Template] Light loaded: {_lightTemplateMatcher.Template?.Width}x{_lightTemplateMatcher.Template?.Height}");
+            }
+
+            if (_cachedDarkTemplatePath == null && _cachedLightTemplatePath == null)
+            {
+                Log($"[Template] WARNING: No templates found!");
             }
 
             _templatesInitialized = true;
+        }
+
+        private static void FindTemplatePaths()
+        {
+            var appData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            Log($"[Template] LocalApplicationData = {appData}");
+
+            // Check 1: Direct LocalApplicationData (for packaged MAUI apps, this IS the correct path)
+            var darkPath = Path.Combine(appData, "arrow_template_dark.png");
+            var lightPath = Path.Combine(appData, "arrow_template_light.png");
+
+            Log($"[Template] Check: dark exists={File.Exists(darkPath)}, light exists={File.Exists(lightPath)}");
+
+            if (File.Exists(darkPath)) _cachedDarkTemplatePath = darkPath;
+            if (File.Exists(lightPath)) _cachedLightTemplatePath = lightPath;
+
+            if (_cachedDarkTemplatePath != null || _cachedLightTemplatePath != null)
+            {
+                Log($"[Template] Found in direct path");
+                return;
+            }
+
+            // Check 2: For console apps, search in Packages folder
+            var packagesPath = Path.Combine(appData, "Packages");
+            if (!Directory.Exists(packagesPath))
+            {
+                Log($"[Template] No Packages folder, templates NOT FOUND");
+                return;
+            }
+
+            try
+            {
+                foreach (var dir in Directory.GetDirectories(packagesPath))
+                {
+                    CheckPackageDir(dir, ref darkPath, ref lightPath);
+                    if (_cachedDarkTemplatePath != null && _cachedLightTemplatePath != null)
+                    {
+                        Log($"[Template] Found in package dir");
+                        return;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"[Template] Error: {ex.Message}");
+            }
+
+            if (_cachedDarkTemplatePath == null && _cachedLightTemplatePath == null)
+            {
+                Log($"[Template] WARNING: No templates found!");
+            }
+        }
+
+        private static void CheckPackageDir(string packageDir, ref string darkPath, ref string lightPath)
+        {
+            var localPath = Path.Combine(packageDir, "LocalCache", "Local");
+            if (!Directory.Exists(localPath)) return;
+
+            if (_cachedDarkTemplatePath == null)
+            {
+                var testDark = Path.Combine(localPath, "arrow_template_dark.png");
+                if (File.Exists(testDark)) _cachedDarkTemplatePath = testDark;
+            }
+            if (_cachedLightTemplatePath == null)
+            {
+                var testLight = Path.Combine(localPath, "arrow_template_light.png");
+                if (File.Exists(testLight)) _cachedLightTemplatePath = testLight;
+            }
         }
 
         /// <summary>
@@ -155,9 +240,10 @@ namespace CameraMaui.RingCode
                 var ringImage = ExtractRingRegion(grayImage, region);
                 long t1 = sw.ElapsedMilliseconds;
 
-                // Step 2: Extract white foreground region
+                // Step 2: Extract white foreground region (also refines OuterRadius)
                 var foregroundMask = ExtractForegroundRegion(ringImage, region);
                 result.ForegroundMask = foregroundMask;
+                result.OuterRadius = region.OuterRadius;  // Update with refined radius
                 long t2 = sw.ElapsedMilliseconds;
 
                 if (EnableDetailedLog)
@@ -191,9 +277,12 @@ namespace CameraMaui.RingCode
                 long t3 = sw.ElapsedMilliseconds;
 
                 // Step 4 & 5: Fast decode with fallback
+                // Use actual InnerRadius from segmentation instead of fixed ratio
                 float bigRadius = region.OuterRadius;
-                float innerRadius = bigRadius * (float)INNER_RATIO;
-                float centerRadius = bigRadius * (float)CENTER_RATIO;
+                float innerRadius = region.InnerRadius;  // Use actual inner boundary from radial scan
+                float centerRadius = (innerRadius + bigRadius) / 2f;  // Midpoint of data ring
+
+                Log($"Sampling radii: inner={innerRadius:F0}, center={centerRadius:F0}, outer={bigRadius:F0}");
 
                 string bestBinary = DecodeWithRegionIntersection(
                     foregroundMask, region.Center, innerRadius, centerRadius, bigRadius, baseAngle);
@@ -408,77 +497,128 @@ namespace CameraMaui.RingCode
             CvInvoke.AdaptiveThreshold(smoothed, binaryAdaptive, 255,
                 AdaptiveThresholdType.GaussianC, ThresholdType.Binary, blockSize, C);
 
-            // Step 7: Choose best binary result based on ring type
+            // Step 6b: LOCAL_THRESHOLD approach (similar to HALCON)
+            // HALCON: mean_image + dyn_threshold
+            // Compute local mean using box filter, then threshold based on difference
+            int localBlockSize = Math.Max(41, (int)(region.OuterRadius / 3) | 1);
+            localBlockSize = Math.Min(localBlockSize, 151);
+
+            var localMean = new Image<Gray, byte>(smoothed.Size);
+            CvInvoke.Blur(smoothed, localMean, new System.Drawing.Size(localBlockSize, localBlockSize), new Point(-1, -1));
+
+            // Dynamic threshold: compare pixel to local mean
+            // For light rings: pixel < localMean - offset means dark mark (foreground)
+            // For dark rings: pixel > localMean + offset means bright mark (foreground)
+            // Higher offset = better separation between regions
+            double localOffset = 18;  // Increased for better region separation
+            var binaryLocal = new Image<Gray, byte>(smoothed.Size);
+
+            // Compute difference: localMean - smoothed (for finding dark regions)
+            // or smoothed - localMean (for finding bright regions)
+            using var diffDark = new Image<Gray, byte>(smoothed.Size);
+            using var diffBright = new Image<Gray, byte>(smoothed.Size);
+            CvInvoke.Subtract(localMean, smoothed, diffDark);  // Positive where original is darker than mean
+            CvInvoke.Subtract(smoothed, localMean, diffBright);  // Positive where original is brighter than mean
+
+            // Threshold the difference
+            if (isLightRing)
+            {
+                // Light ring: find dark marks (where original < localMean - offset)
+                CvInvoke.Threshold(diffDark, binaryLocal, localOffset, 255, ThresholdType.Binary);
+            }
+            else
+            {
+                // Dark ring: find bright marks (where original > localMean + offset)
+                CvInvoke.Threshold(diffBright, binaryLocal, localOffset, 255, ThresholdType.Binary);
+            }
+
+            // Apply erosion to break apart connected regions in Local threshold result
+            using var erodeKernel = CvInvoke.GetStructuringElement(ElementShape.Ellipse,
+                new System.Drawing.Size(3, 3), new Point(-1, -1));
+            CvInvoke.Erode(binaryLocal, binaryLocal, erodeKernel, new Point(-1, -1), 1, BorderType.Default, new MCvScalar(0));
+
+            localMean.Dispose();
+
+            // Step 7: Choose best binary result from Otsu, Adaptive, and Local methods
             Image<Gray, byte> binary;
             string binaryMethod;
+
+            // Expected: ~30-50% of ring area should be white (data marks)
+            int ringArea = (int)(Math.PI * (outerR * outerR - innerR * innerR));
+            double targetRatio = 0.40;
+
+            // Prepare candidates for comparison
+            var candidates = new List<(Image<Gray, byte> img, string name, double ratio)>();
 
             if (isLightRing)
             {
                 // Light ring: we want dark marks to become WHITE in output
-                // Otsu Binary gives: bright->white, dark->black
-                // So we need to INVERT: dark marks become white
                 var binaryOtsuInv = binaryOtsu.Not();
+                var binaryAdaptiveInv = binaryAdaptive.Not();
 
-                // Count white pixels in data area for validation
+                // Count white pixels in data area for each method
                 var maskedOtsu = binaryOtsuInv.Copy(ringMask);
-                var maskedAdaptiveInv = binaryAdaptive.Not().Copy(ringMask);
+                var maskedAdaptive = binaryAdaptiveInv.Copy(ringMask);
+                var maskedLocal = binaryLocal.Copy(ringMask);
 
                 int whiteOtsu = CvInvoke.CountNonZero(maskedOtsu);
-                int whiteAdaptive = CvInvoke.CountNonZero(maskedAdaptiveInv);
+                int whiteAdaptive = CvInvoke.CountNonZero(maskedAdaptive);
+                int whiteLocal = CvInvoke.CountNonZero(maskedLocal);
 
-                // Expected: ~30-50% of ring area should be white (data marks)
-                int ringArea = (int)(Math.PI * (outerR * outerR - innerR * innerR));
                 double ratioOtsu = (double)whiteOtsu / ringArea;
                 double ratioAdaptive = (double)whiteAdaptive / ringArea;
+                double ratioLocal = (double)whiteLocal / ringArea;
 
-                Log($"    Light ring binary: Otsu={whiteOtsu}({ratioOtsu:P0}), Adaptive={whiteAdaptive}({ratioAdaptive:P0})");
+                Log($"    Light ring binary: Otsu={ratioOtsu:P0}, Adaptive={ratioAdaptive:P0}, Local={ratioLocal:P0}");
 
-                // Choose the one closer to expected ratio (30-50%)
-                double targetRatio = 0.40;
-                if (Math.Abs(ratioOtsu - targetRatio) < Math.Abs(ratioAdaptive - targetRatio))
-                {
-                    binary = binaryOtsuInv;
-                    binaryMethod = "OtsuInv";
-                }
-                else
-                {
-                    binary = binaryAdaptive.Not();
-                    binaryMethod = "AdaptiveInv";
-                }
+                candidates.Add((binaryOtsuInv, "OtsuInv", ratioOtsu));
+                candidates.Add((binaryAdaptiveInv, "AdaptiveInv", ratioAdaptive));
+                candidates.Add((binaryLocal, "Local", ratioLocal));
 
                 maskedOtsu.Dispose();
-                maskedAdaptiveInv.Dispose();
+                maskedAdaptive.Dispose();
+                maskedLocal.Dispose();
             }
             else
             {
                 // Dark ring: we want bright marks to become WHITE in output
-                // Otsu Binary gives: bright->white, dark->black - already correct!
                 var maskedOtsu = binaryOtsu.Copy(ringMask);
                 var maskedAdaptive = binaryAdaptive.Copy(ringMask);
+                var maskedLocal = binaryLocal.Copy(ringMask);
 
                 int whiteOtsu = CvInvoke.CountNonZero(maskedOtsu);
                 int whiteAdaptive = CvInvoke.CountNonZero(maskedAdaptive);
+                int whiteLocal = CvInvoke.CountNonZero(maskedLocal);
 
-                int ringArea = (int)(Math.PI * (outerR * outerR - innerR * innerR));
                 double ratioOtsu = (double)whiteOtsu / ringArea;
                 double ratioAdaptive = (double)whiteAdaptive / ringArea;
+                double ratioLocal = (double)whiteLocal / ringArea;
 
-                Log($"    Dark ring binary: Otsu={whiteOtsu}({ratioOtsu:P0}), Adaptive={whiteAdaptive}({ratioAdaptive:P0})");
+                Log($"    Dark ring binary: Otsu={ratioOtsu:P0}, Adaptive={ratioAdaptive:P0}, Local={ratioLocal:P0}");
 
-                double targetRatio = 0.40;
-                if (Math.Abs(ratioOtsu - targetRatio) < Math.Abs(ratioAdaptive - targetRatio))
-                {
-                    binary = binaryOtsu;
-                    binaryMethod = "Otsu";
-                }
-                else
-                {
-                    binary = binaryAdaptive;
-                    binaryMethod = "Adaptive";
-                }
+                candidates.Add((binaryOtsu, "Otsu", ratioOtsu));
+                candidates.Add((binaryAdaptive, "Adaptive", ratioAdaptive));
+                candidates.Add((binaryLocal, "Local", ratioLocal));
 
                 maskedOtsu.Dispose();
                 maskedAdaptive.Dispose();
+                maskedLocal.Dispose();
+            }
+
+            // Choose the method closest to target ratio (30-50%)
+            // Simply select the method with ratio closest to target
+            var bestCandidate = candidates
+                .OrderBy(c => Math.Abs(c.ratio - targetRatio))
+                .First();
+
+            binary = bestCandidate.img.Clone();
+            binaryMethod = bestCandidate.name;
+            Log($"    Selected: {binaryMethod} (ratio={bestCandidate.ratio:P0}, target={targetRatio:P0})");
+
+            // Cleanup all candidates (we have cloned the best one)
+            foreach (var c in candidates)
+            {
+                c.img.Dispose();
             }
 
             // Step 8: Morphological cleanup (like HALCON fill_up + select_shape)
@@ -525,14 +665,92 @@ namespace CameraMaui.RingCode
             Log($"  Foreground: method={binaryMethod}, whitePixels={finalWhite}, " +
                 $"contours: kept={keptCount}, removed={removedCount} (minArea={minArea})");
 
-            // Cleanup
-            binaryOtsu.Dispose();
-            binaryAdaptive.Dispose();
-            if (binary != binaryOtsu && binary != binaryAdaptive)
-                binary.Dispose();
+            // Refine outer radius using the binary mask - find actual extent of data marks
+            float refinedOuterR = RefineOuterRadiusFromMask(foreground, region.Center, region.OuterRadius, region.InnerRadius);
+            if (refinedOuterR > region.OuterRadius * 0.9f && refinedOuterR < region.OuterRadius * 1.15f)
+            {
+                Log($"  Refined outerR: {region.OuterRadius:F0} -> {refinedOuterR:F0}");
+                region.OuterRadius = refinedOuterR;
+            }
+
+            // Cleanup - binary is already a clone, candidates are disposed above
+            // binaryOtsu, binaryAdaptive, binaryLocal were already disposed via candidates loop
+            binary.Dispose();
 
             return foreground;
         }
+
+        /// <summary>
+        /// Refine outer radius by scanning the binary foreground mask
+        /// Finds the maximum extent of white pixels (data marks) at each angle
+        /// </summary>
+        private float RefineOuterRadiusFromMask(Image<Gray, byte> foreground, PointF center, float currentOuterR, float innerR)
+        {
+            int cx = (int)center.X;
+            int cy = (int)center.Y;
+            int numAngles = 180;  // Every 2 degrees for higher density
+            var maxRadii = new List<float>();
+            _lastFitPoints.Clear();  // Store for debug visualization
+
+            // Define the expected data ring area (typically 50-90% of outer radius)
+            float minDataR = innerR * 1.1f;  // Just outside inner circle
+            float maxDataR = currentOuterR * 0.95f;  // Don't go beyond current estimate
+
+            for (int a = 0; a < numAngles; a++)
+            {
+                double angle = a * 2 * Math.PI / numAngles;
+                float cosA = (float)Math.Cos(angle);
+                float sinA = (float)Math.Sin(angle);
+
+                // Scan within the expected data ring area only
+                float maxR = 0;
+                for (float r = minDataR; r < maxDataR; r += 2)
+                {
+                    int x = (int)(cx + r * cosA);
+                    int y = (int)(cy + r * sinA);
+
+                    if (x < 0 || x >= foreground.Width || y < 0 || y >= foreground.Height)
+                        break;
+
+                    if (foreground.Data[y, x, 0] > 128)  // White pixel = data mark
+                    {
+                        maxR = r;  // Update to this radius
+                    }
+                }
+
+                if (maxR > minDataR)  // Only count if we found data marks
+                {
+                    maxRadii.Add(maxR);
+                    // Store the point for visualization
+                    int px = (int)(cx + maxR * cosA);
+                    int py = (int)(cy + maxR * sinA);
+                    _lastFitPoints.Add(new Point(px, py));
+                }
+            }
+
+            if (maxRadii.Count < 10)
+            {
+                return currentOuterR;  // Not enough data, keep original
+            }
+
+            // Use 95th percentile to capture the outermost data marks
+            maxRadii.Sort();
+            int p95Index = (int)(maxRadii.Count * 0.95);
+            float refinedR = maxRadii[Math.Min(p95Index, maxRadii.Count - 1)];
+
+            // Add small margin so circle is OUTSIDE data marks, not cutting through them
+            refinedR += 5;  // Add 5 pixels margin
+
+            // Clamp to reasonable range - allow up to 20% reduction for tighter fit
+            refinedR = Math.Min(refinedR, currentOuterR * 1.05f);
+            refinedR = Math.Max(refinedR, currentOuterR * 0.80f);
+
+            return refinedR;
+        }
+
+        // Store fit points for debug visualization
+        private List<Point> _lastFitPoints = new List<Point>();
+        public IReadOnlyList<Point> LastFitPoints => _lastFitPoints;
 
         /// <summary>
         /// Calculate Otsu threshold from histogram
@@ -591,17 +809,34 @@ namespace CameraMaui.RingCode
             _lastIsYShapeArrow = false;
             _lastArrowTip = PointF.Empty;
 
-            // Method 1 (PRIMARY): Find arrow by analyzing EDGE contours on ORIGINAL image
+            // Method 1 (PRIMARY): Template matching using user-created arrow templates
+            // This is the most reliable method with proper template polarity handling
+            Log($"  [Method 1] Template matching (ring type: {(_lastRingIsLight ? "LIGHT" : "DARK")})...");
+            var templateResult = FindArrowByTemplateMatching(foreground, region);
+            if (templateResult.angle.HasValue && templateResult.matchResult?.Score >= 0.5)
+            {
+                _lastMatchType = $"Template ({templateResult.templateType})";
+                Log($"  Template match found arrow at: {templateResult.angle.Value:F1}° (score={templateResult.matchResult.Score:F3})");
+                return templateResult.angle.Value;
+            }
+            else
+            {
+                LastTemplateMatchError = templateResult.error ?? "Score too low";
+                Log($"  Template match failed: {LastTemplateMatchError}");
+            }
+
+            // Method 2 (FALLBACK): Find arrow by analyzing EDGE contours on ORIGINAL image
             // Arrow is at outer edge, has distinctive triangular/Y shape with LOW solidity
-            Log($"  [Method 1] Edge contour analysis on original image...");
+            Log($"  [Method 2] Edge contour analysis on original image...");
             double contourAngle = FindArrowByEdgeContours(original, region);
             if (contourAngle != double.MinValue)
             {
+                _lastMatchType = "EdgeContour";
                 Log($"  Edge contour analysis found arrow at: {contourAngle:F1}°");
                 return contourAngle;
             }
 
-            // Method 2 (FALLBACK): Use triangle TIP points if available (from segmentation)
+            // Method 3 (FALLBACK): Use triangle TIP points if available (from segmentation)
             // Note: TrianglePoints from segmentation is often unreliable
             if (region.TrianglePoints.Count >= 1)
             {
@@ -611,15 +846,18 @@ namespace CameraMaui.RingCode
                     .First();
 
                 double dist = Math.Sqrt(Math.Pow(arrowTip.X - region.Center.X, 2) + Math.Pow(arrowTip.Y - region.Center.Y, 2));
+                // Image coords: Y-down, angles clockwise from right (0°=right, 90°=down)
                 double angle = Math.Atan2(arrowTip.Y - region.Center.Y, arrowTip.X - region.Center.X);
                 double angleDeg = angle * 180 / Math.PI;
 
-                Log($"  [Method 2 fallback] Arrow TIP at ({arrowTip.X:F1}, {arrowTip.Y:F1}), dist={dist:F1}, angle={angleDeg:F1}°");
+                _lastMatchType = "TriangleTip";
+                Log($"  [Method 3 fallback] Arrow TIP at ({arrowTip.X:F1}, {arrowTip.Y:F1}), dist={dist:F1}, angle={angleDeg:F1}°");
                 return angleDeg;
             }
 
-            // Method 3: Intensity peak detection as last resort
-            Log($"  [Method 3] Using intensity peak detection as last resort...");
+            // Method 4: Intensity peak detection as last resort
+            _lastMatchType = "IntensityPeak";
+            Log($"  [Method 4] Using intensity peak detection as last resort...");
             return FindRotationByIntensityPeak(foreground, region);
         }
 
@@ -653,6 +891,23 @@ namespace CameraMaui.RingCode
             var binaryROIInv = new Image<Gray, byte>(roiImage.Size);
             CvInvoke.BitwiseNot(binaryROI, binaryROIInv);
 
+            // Save preprocessing debug images
+            if (!string.IsNullOrEmpty(DebugOutputDir))
+            {
+                try
+                {
+                    string timestamp = DateTime.Now.ToString("HHmmss_fff");
+                    roiImage.Save(Path.Combine(DebugOutputDir, $"preprocess_1_gray_{timestamp}.png"));
+                    binaryROI.Save(Path.Combine(DebugOutputDir, $"preprocess_2_binary_{timestamp}.png"));
+                    binaryROIInv.Save(Path.Combine(DebugOutputDir, $"preprocess_3_binaryInv_{timestamp}.png"));
+                    Log($"  [DEBUG] Saved preprocessing images: preprocess_*_{timestamp}.png");
+                }
+                catch (Exception ex)
+                {
+                    Log($"  [DEBUG] Failed to save preprocessing images: {ex.Message}");
+                }
+            }
+
             double bestScore = 0;
             double bestAngle = 0;
             PointF bestCenter = PointF.Empty;
@@ -670,6 +925,27 @@ namespace CameraMaui.RingCode
             {
                 templatesToTry.Add((_lightTemplateMatcher, "Light", binaryROI));
                 templatesToTry.Add((_lightTemplateMatcher, "LightInv", binaryROIInv));
+            }
+
+            // Save template images once
+            if (!string.IsNullOrEmpty(DebugOutputDir))
+            {
+                try
+                {
+                    string timestamp = DateTime.Now.ToString("HHmmss_fff");
+                    if (_darkTemplateMatcher?.IsLoaded == true)
+                    {
+                        var darkTemplate = GetBinaryTemplate(_darkTemplateMatcher);
+                        darkTemplate?.Save(Path.Combine(DebugOutputDir, $"template_dark_{timestamp}.png"));
+                    }
+                    if (_lightTemplateMatcher?.IsLoaded == true)
+                    {
+                        var lightTemplate = GetBinaryTemplate(_lightTemplateMatcher);
+                        lightTemplate?.Save(Path.Combine(DebugOutputDir, $"template_light_{timestamp}.png"));
+                    }
+                    Log($"  [DEBUG] Saved template images");
+                }
+                catch { }
             }
 
             foreach (var (matcher, name, searchImage) in templatesToTry)
@@ -786,85 +1062,458 @@ namespace CameraMaui.RingCode
         }
 
         /// <summary>
-        /// Find arrow using template matching (tries both dark and light templates)
+        /// Verify if a position in the foreground image contains a Y-shape structure.
+        /// Y-shape characteristics: low solidity (< 0.75), has branch-like structure
+        /// </summary>
+        /// <param name="foreground">Binary foreground mask</param>
+        /// <param name="center">Position to verify</param>
+        /// <param name="roiSize">Size of ROI to extract</param>
+        /// <param name="ringCenter">Center of the ring (for direction analysis)</param>
+        /// <returns>(isYShape, solidity, contourArea)</returns>
+        private (bool isYShape, double solidity, double area) VerifyYShapeAtPosition(
+            Image<Gray, byte> foreground, PointF center, int roiSize, PointF ringCenter)
+        {
+            try
+            {
+                // Extract ROI around the match position
+                int halfSize = roiSize / 2;
+                int x = Math.Max(0, (int)center.X - halfSize);
+                int y = Math.Max(0, (int)center.Y - halfSize);
+                int w = Math.Min(roiSize, foreground.Width - x);
+                int h = Math.Min(roiSize, foreground.Height - y);
+
+                if (w < roiSize / 2 || h < roiSize / 2)
+                    return (false, 1.0, 0);
+
+                foreground.ROI = new Rectangle(x, y, w, h);
+                var roi = foreground.Clone();
+                foreground.ROI = Rectangle.Empty;
+
+                // Find contours in ROI
+                using var contours = new VectorOfVectorOfPoint();
+                using var hierarchy = new Mat();
+                CvInvoke.FindContours(roi, contours, hierarchy, RetrType.External, ChainApproxMethod.ChainApproxSimple);
+
+                if (contours.Size == 0)
+                    return (false, 1.0, 0);
+
+                // Find the largest contour (should be the Y-shape)
+                double maxArea = 0;
+                int maxIdx = -1;
+                for (int i = 0; i < contours.Size; i++)
+                {
+                    double area = CvInvoke.ContourArea(contours[i]);
+                    if (area > maxArea)
+                    {
+                        maxArea = area;
+                        maxIdx = i;
+                    }
+                }
+
+                if (maxIdx < 0 || maxArea < 100)
+                    return (false, 1.0, maxArea);
+
+                var contour = contours[maxIdx];
+
+                // Calculate solidity = area / convex hull area
+                using var hull = new VectorOfPoint();
+                CvInvoke.ConvexHull(contour, hull);
+                double hullArea = CvInvoke.ContourArea(hull);
+                double solidity = hullArea > 0 ? maxArea / hullArea : 1.0;
+
+                // Y-shape has LOW solidity (gaps between branches)
+                // Typical Y-shape solidity: 0.4 - 0.7
+                // Rectangular data marks: 0.85 - 0.98
+                bool hasLowSolidity = solidity < 0.78;
+
+                // Additional check: bounding rect aspect ratio
+                var boundRect = CvInvoke.BoundingRectangle(contour);
+                double aspectRatio = (double)boundRect.Width / Math.Max(1, boundRect.Height);
+                // Y-shape should be roughly square-ish to slightly elongated
+                bool hasGoodAspect = aspectRatio > 0.5 && aspectRatio < 2.0;
+
+                // Check convexity defects (Y-shape has significant defects)
+                bool hasDefects = false;
+                if (contour.Size >= 5)
+                {
+                    using var hullIndices = new VectorOfInt();
+                    CvInvoke.ConvexHull(contour, hullIndices);
+                    if (hullIndices.Size >= 3)
+                    {
+                        using var defects = new Mat();
+                        CvInvoke.ConvexityDefects(contour, hullIndices, defects);
+                        if (!defects.IsEmpty && defects.Rows > 0)
+                        {
+                            // Count significant defects (depth > 5 pixels)
+                            int significantDefects = 0;
+                            var defectData = new int[defects.Rows * 4];
+                            defects.CopyTo(defectData);
+                            for (int i = 0; i < defects.Rows; i++)
+                            {
+                                float depth = defectData[i * 4 + 3] / 256f;
+                                if (depth > 5) significantDefects++;
+                            }
+                            // Y-shape should have at least 1 significant defect (the center gap)
+                            hasDefects = significantDefects >= 1;
+                        }
+                    }
+                }
+
+                bool isYShape = hasLowSolidity && (hasGoodAspect || hasDefects);
+
+                Log($"    [YShapeVerify] pos=({center.X:F0},{center.Y:F0}), solidity={solidity:F3}, area={maxArea:F0}, aspect={aspectRatio:F2}, defects={hasDefects}, isY={isYShape}");
+
+                return (isYShape, solidity, maxArea);
+            }
+            catch (Exception ex)
+            {
+                Log($"    [YShapeVerify] Error: {ex.Message}");
+                return (false, 1.0, 0);
+            }
+        }
+
+        /// <summary>
+        /// Find arrow using template matching - selects template based on ring type
+        /// For LIGHT rings: binary image has WHITE marks, so we invert the LIGHT template
+        /// For DARK rings: binary image has WHITE marks, use DARK template directly
         /// Returns: (angle, error, matchResult, templateType)
         /// </summary>
         private (double? angle, string error, ArrowMatchResult matchResult, string templateType) FindArrowByTemplateMatching(Image<Gray, byte> foreground, RingImageSegmentation.RingRegion region)
         {
-            ArrowMatchResult bestResult = null;
-            string bestTemplateType = "";
-            string errors = "";
+            // Select template based on ring type
+            Image<Gray, byte> activeTemplate = null;
+            string templateType = "";
 
-            // Try dark template first - use multi-angle matching for better results
-            if (_darkTemplateMatcher?.IsLoaded == true)
+            if (_lastRingIsLight && _lightTemplateMatcher?.IsLoaded == true)
             {
-                // Method 1: Standard template matching
-                var darkResult = _darkTemplateMatcher.FindArrowMultiAngle(foreground, minScore: 0.4,
-                    angleStart: -180, angleEnd: 180, angleStep: 15);
+                // LIGHT ring: binary has WHITE marks (dark arrows), invert LIGHT template
+                activeTemplate = _lightTemplateMatcher.Template.Clone();
+                CvInvoke.BitwiseNot(activeTemplate, activeTemplate);
+                templateType = "Light (inverted)";
+                Log($"  [TemplateMatch] Using LIGHT (inverted) template ({activeTemplate.Width}x{activeTemplate.Height})");
+            }
+            else if (!_lastRingIsLight && _darkTemplateMatcher?.IsLoaded == true)
+            {
+                // DARK ring: use DARK template directly
+                activeTemplate = _darkTemplateMatcher.Template.Clone();
+                templateType = "Dark";
+                Log($"  [TemplateMatch] Using DARK template ({activeTemplate.Width}x{activeTemplate.Height})");
+            }
+            else if (_darkTemplateMatcher?.IsLoaded == true)
+            {
+                // Fallback to dark template
+                activeTemplate = _darkTemplateMatcher.Template.Clone();
+                templateType = "Dark (fallback)";
+                Log($"  [TemplateMatch] Using DARK template as fallback ({activeTemplate.Width}x{activeTemplate.Height})");
+            }
+            else if (_lightTemplateMatcher?.IsLoaded == true)
+            {
+                // Fallback to light template (inverted)
+                activeTemplate = _lightTemplateMatcher.Template.Clone();
+                CvInvoke.BitwiseNot(activeTemplate, activeTemplate);
+                templateType = "Light (inverted fallback)";
+                Log($"  [TemplateMatch] Using LIGHT (inverted) template as fallback ({activeTemplate.Width}x{activeTemplate.Height})");
+            }
 
-                // Method 2: Try edge-based matching if standard fails
-                if (!darkResult.IsFound)
-                {
-                    Log($"    Dark template standard failed, trying edge-based...");
-                    darkResult = _darkTemplateMatcher.FindArrowEdgeBased(foreground, minScore: 0.3,
-                        angleStart: -180, angleEnd: 180, angleStep: 15);
-                }
+            if (activeTemplate == null)
+            {
+                return (null, "No template loaded", null, "");
+            }
 
-                if (darkResult.IsFound)
+            try
+            {
+                // Calculate scale based on ring size (single scale, not multi-scale for speed)
+                float outerR = region.OuterRadius;
+                float innerR = region.InnerRadius;
+                float expectedArrowSize = (outerR - innerR) * 0.7f;
+                float scale = expectedArrowSize / activeTemplate.Width;
+                int scaledSize = Math.Max(15, (int)(activeTemplate.Width * scale));
+
+                // Pre-scale template once
+                using var scaledTemplate = new Image<Gray, byte>(scaledSize, scaledSize);
+                CvInvoke.Resize(activeTemplate, scaledTemplate, new System.Drawing.Size(scaledSize, scaledSize));
+
+                // Save preprocessing debug images
+                if (!string.IsNullOrEmpty(DebugOutputDir))
                 {
-                    if (bestResult == null || darkResult.Score > bestResult.Score)
+                    try
                     {
-                        bestResult = darkResult;
-                        bestTemplateType = "Dark";
-                        Log($"    Dark template matched: score={darkResult.Score:F2}, angle={darkResult.Angle:F1}°");
+                        string timestamp = DateTime.Now.ToString("HHmmss_fff");
+                        foreground.Save(Path.Combine(DebugOutputDir, $"preprocess_1_foreground_{timestamp}.png"));
+                        activeTemplate.Save(Path.Combine(DebugOutputDir, $"preprocess_2_template_{timestamp}.png"));
+                        scaledTemplate.Save(Path.Combine(DebugOutputDir, $"preprocess_3_scaledTemplate_{timestamp}.png"));
+                        Log($"  [DEBUG] Saved preprocessing: preprocess_*_{timestamp}.png");
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"  [DEBUG] Failed to save preprocessing: {ex.Message}");
                     }
                 }
-                else
-                {
-                    errors += $"深色範本: {darkResult.ErrorMessage}; ";
-                }
-            }
 
-            // Try light template - use multi-angle matching
-            if (_lightTemplateMatcher?.IsLoaded == true)
-            {
-                // Method 1: Standard template matching
-                var lightResult = _lightTemplateMatcher.FindArrowMultiAngle(foreground, minScore: 0.4,
-                    angleStart: -180, angleEnd: 180, angleStep: 15);
+                Log($"  [TemplateMatch] Coarse-to-fine search with Y-shape verification");
 
-                // Method 2: Try edge-based matching if standard fails
-                if (!lightResult.IsFound)
-                {
-                    Log($"    Light template standard failed, trying edge-based...");
-                    lightResult = _lightTemplateMatcher.FindArrowEdgeBased(foreground, minScore: 0.3,
-                        angleStart: -180, angleEnd: 180, angleStep: 15);
-                }
+                // Store multiple candidates for Y-shape verification
+                var candidates = new List<(double score, double rotation, PointF center)>();
+                double minScoreThreshold = 0.45;  // Lower threshold to collect more candidates
+                float minArrowDist = outerR * 0.55f;
+                float maxArrowDist = outerR * 0.85f;
 
-                if (lightResult.IsFound)
+                // === PHASE 1: Coarse search (30° steps = 12 iterations) ===
+                var coarseCandidates = new List<(double score, double angle)>();
+                for (double angle = 0; angle < 360; angle += 30)
                 {
-                    if (bestResult == null || lightResult.Score > bestResult.Score)
+                    var scaledCenter = new PointF(scaledSize / 2f, scaledSize / 2f);
+                    using var rotMat = new Mat();
+                    CvInvoke.GetRotationMatrix2D(scaledCenter, -angle, 1.0, rotMat);
+
+                    using var rotated = new Image<Gray, byte>(scaledSize, scaledSize);
+                    CvInvoke.WarpAffine(scaledTemplate, rotated, rotMat, new System.Drawing.Size(scaledSize, scaledSize));
+
+                    if (rotated.Width >= foreground.Width || rotated.Height >= foreground.Height)
+                        continue;
+
+                    using var result = new Mat();
+                    CvInvoke.MatchTemplate(foreground, rotated, result, TemplateMatchingType.CcoeffNormed);
+
+                    double minVal = 0, maxVal = 0;
+                    Point minLoc = Point.Empty, maxLoc = Point.Empty;
+                    CvInvoke.MinMaxLoc(result, ref minVal, ref maxVal, ref minLoc, ref maxLoc);
+
+                    if (maxVal > minScoreThreshold)
                     {
-                        bestResult = lightResult;
-                        bestTemplateType = "Light";
-                        Log($"    Light template matched: score={lightResult.Score:F2}, angle={lightResult.Angle:F1}°");
+                        float matchX = maxLoc.X + rotated.Width / 2f;
+                        float matchY = maxLoc.Y + rotated.Height / 2f;
+                        float distFromCenter = (float)Math.Sqrt(
+                            Math.Pow(matchX - region.Center.X, 2) +
+                            Math.Pow(matchY - region.Center.Y, 2));
+
+                        if (distFromCenter >= minArrowDist && distFromCenter <= maxArrowDist)
+                        {
+                            candidates.Add((maxVal, angle, new PointF(matchX, matchY)));
+                            coarseCandidates.Add((maxVal, angle));
+                        }
                     }
                 }
-                else
+
+                // === PHASE 2: Fine search around top coarse candidates ===
+                // Sort coarse candidates and do fine search on top 3
+                var topCoarse = coarseCandidates.OrderByDescending(c => c.score).Take(3).ToList();
+                foreach (var (coarseScore, baseAngle) in topCoarse)
                 {
-                    errors += $"淺色範本: {lightResult.ErrorMessage}; ";
+                    for (double offset = -20; offset <= 20; offset += 5)
+                    {
+                        if (offset == 0) continue; // Already tested in coarse phase
+                        double fineAngle = baseAngle + offset;
+                        if (fineAngle < 0) fineAngle += 360;
+                        if (fineAngle >= 360) fineAngle -= 360;
+
+                        var scaledCenter = new PointF(scaledSize / 2f, scaledSize / 2f);
+                        using var rotMat = new Mat();
+                        CvInvoke.GetRotationMatrix2D(scaledCenter, -fineAngle, 1.0, rotMat);
+
+                        using var rotated = new Image<Gray, byte>(scaledSize, scaledSize);
+                        CvInvoke.WarpAffine(scaledTemplate, rotated, rotMat, new System.Drawing.Size(scaledSize, scaledSize));
+
+                        if (rotated.Width >= foreground.Width || rotated.Height >= foreground.Height)
+                            continue;
+
+                        using var result = new Mat();
+                        CvInvoke.MatchTemplate(foreground, rotated, result, TemplateMatchingType.CcoeffNormed);
+
+                        double minVal = 0, maxVal = 0;
+                        Point minLoc = Point.Empty, maxLoc = Point.Empty;
+                        CvInvoke.MinMaxLoc(result, ref minVal, ref maxVal, ref minLoc, ref maxLoc);
+
+                        if (maxVal > minScoreThreshold)
+                        {
+                            float matchX = maxLoc.X + rotated.Width / 2f;
+                            float matchY = maxLoc.Y + rotated.Height / 2f;
+                            float distFromCenter = (float)Math.Sqrt(
+                                Math.Pow(matchX - region.Center.X, 2) +
+                                Math.Pow(matchY - region.Center.Y, 2));
+
+                            if (distFromCenter >= minArrowDist && distFromCenter <= maxArrowDist)
+                            {
+                                candidates.Add((maxVal, fineAngle, new PointF(matchX, matchY)));
+                            }
+                        }
+                    }
                 }
-            }
 
-            if (bestResult != null && bestResult.IsFound)
+                Log($"  [TemplateMatch] Found {candidates.Count} candidates, verifying Y-shape...");
+
+                // === PHASE 3: Verify candidates with Y-shape check ===
+                // Sort by score (descending) and verify each
+                double bestScore = 0;
+                double bestRotation = 0;
+                PointF bestMatchCenter = PointF.Empty;
+                int roiSize = (int)((outerR - innerR) * 1.2);  // ROI size based on ring width
+
+                foreach (var (score, rotation, center) in candidates.OrderByDescending(c => c.score))
+                {
+                    // Verify Y-shape at this position
+                    var (isYShape, solidity, area) = VerifyYShapeAtPosition(foreground, center, roiSize, region.Center);
+
+                    if (isYShape)
+                    {
+                        // Found valid Y-shape, use this candidate
+                        bestScore = score;
+                        bestRotation = rotation;
+                        bestMatchCenter = center;
+                        Log($"  [TemplateMatch] Verified Y-shape at ({center.X:F0},{center.Y:F0}), score={score:F3}, solidity={solidity:F3}");
+                        break;
+                    }
+                    else if (bestScore == 0 && score > 0.7)
+                    {
+                        // Store high-score candidate as fallback (even without Y-shape verification)
+                        bestScore = score;
+                        bestRotation = rotation;
+                        bestMatchCenter = center;
+                        Log($"  [TemplateMatch] High-score fallback at ({center.X:F0},{center.Y:F0}), score={score:F3} (not Y-shape)");
+                    }
+                }
+
+                // Save debug image if DebugOutputDir is set
+                if (!string.IsNullOrEmpty(DebugOutputDir))
+                {
+                    try
+                    {
+                        Directory.CreateDirectory(DebugOutputDir);
+                        var debugImg = foreground.Convert<Bgr, byte>();
+                        int cx = (int)region.Center.X;
+                        int cy = (int)region.Center.Y;
+
+                        // Draw ring boundaries
+                        CvInvoke.Circle(debugImg, new Point(cx, cy), (int)region.OuterRadius, new MCvScalar(0, 255, 0), 2);
+                        CvInvoke.Circle(debugImg, new Point(cx, cy), (int)region.InnerRadius, new MCvScalar(0, 255, 0), 2);
+
+                        // Draw fit points used for outer radius refinement (MAGENTA/ORANGE)
+                        Log($"  [DEBUG] Drawing {_lastFitPoints.Count} fit points");
+                        foreach (var pt in _lastFitPoints)
+                        {
+                            // Draw larger points in ORANGE (BGR: 0, 165, 255)
+                            CvInvoke.Circle(debugImg, pt, 6, new MCvScalar(0, 165, 255), -1);  // Orange filled
+                            CvInvoke.Circle(debugImg, pt, 6, new MCvScalar(0, 0, 0), 1);  // Black outline
+                        }
+
+                        // Draw center point
+                        CvInvoke.Circle(debugImg, new Point(cx, cy), 8, new MCvScalar(0, 0, 255), -1);
+
+                        // Draw best match position if found
+                        if (bestScore > 0 && bestMatchCenter != PointF.Empty)
+                        {
+                            int matchX = (int)bestMatchCenter.X;
+                            int matchY = (int)bestMatchCenter.Y;
+
+                            // Draw match center (CYAN)
+                            CvInvoke.Circle(debugImg, new Point(matchX, matchY), 12, new MCvScalar(255, 255, 0), -1);
+                            CvInvoke.Circle(debugImg, new Point(matchX, matchY), 12, new MCvScalar(0, 0, 0), 2);
+
+                            // Draw line from ring center to match center (CYAN)
+                            CvInvoke.Line(debugImg, new Point(cx, cy), new Point(matchX, matchY), new MCvScalar(255, 255, 0), 3);
+
+                            // Calculate angle from match center
+                            double dx = bestMatchCenter.X - region.Center.X;
+                            double dy = bestMatchCenter.Y - region.Center.Y;
+                            double finalAngle = Math.Atan2(dy, dx) * 180.0 / Math.PI;
+                            if (finalAngle < 0) finalAngle += 360;
+
+                            // Draw extended arrow line (CYAN)
+                            double rad = finalAngle * Math.PI / 180;
+                            int arrowEndX = (int)(cx + region.OuterRadius * 1.2 * Math.Cos(rad));
+                            int arrowEndY = (int)(cy + region.OuterRadius * 1.2 * Math.Sin(rad));
+                            CvInvoke.ArrowedLine(debugImg, new Point(cx, cy), new Point(arrowEndX, arrowEndY),
+                                new MCvScalar(255, 255, 0), 4, LineType.AntiAlias);
+
+                            // Add text
+                            CvInvoke.PutText(debugImg, $"Score: {bestScore:F3}", new Point(10, 30),
+                                FontFace.HersheySimplex, 0.8, new MCvScalar(0, 255, 0), 2);
+                            CvInvoke.PutText(debugImg, $"Angle: {finalAngle:F1} deg", new Point(10, 60),
+                                FontFace.HersheySimplex, 0.8, new MCvScalar(0, 255, 255), 2);
+                            CvInvoke.PutText(debugImg, $"Match: ({matchX},{matchY})", new Point(10, 90),
+                                FontFace.HersheySimplex, 0.6, new MCvScalar(255, 255, 0), 2);
+                        }
+                        else
+                        {
+                            CvInvoke.PutText(debugImg, $"NO MATCH (best={bestScore:F3})", new Point(10, 30),
+                                FontFace.HersheySimplex, 0.8, new MCvScalar(0, 0, 255), 2);
+                        }
+
+                        string timestamp = DateTime.Now.ToString("HHmmss_fff");
+                        string debugPath = Path.Combine(DebugOutputDir, $"arrow_debug_{timestamp}.png");
+                        debugImg.Save(debugPath);
+                        Log($"  [DEBUG] Saved arrow detection image: {debugPath}");
+                        debugImg.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"  [DEBUG] Failed to save debug image: {ex.Message}");
+                    }
+                }
+
+                if (bestScore >= 0.4)
+                {
+                    // Find the actual arrow TIP (closest white pixel to ring center)
+                    // The template match center is the CENTER of the Y-shape, not the tip
+                    PointF arrowTip = bestMatchCenter;  // Default to match center
+
+                    // Search within a region around the match center for the closest white pixel
+                    int searchRadius = 60;  // Half of template size
+                    float cx = region.Center.X;
+                    float cy = region.Center.Y;
+                    double minDistToCenter = double.MaxValue;
+
+                    int startX = Math.Max(0, (int)(bestMatchCenter.X - searchRadius));
+                    int endX = Math.Min(foreground.Width - 1, (int)(bestMatchCenter.X + searchRadius));
+                    int startY = Math.Max(0, (int)(bestMatchCenter.Y - searchRadius));
+                    int endY = Math.Min(foreground.Height - 1, (int)(bestMatchCenter.Y + searchRadius));
+
+                    for (int py = startY; py <= endY; py++)
+                    {
+                        for (int px = startX; px <= endX; px++)
+                        {
+                            if (foreground.Data[py, px, 0] > 128)  // White pixel (part of arrow)
+                            {
+                                double distToCenter = Math.Sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy));
+                                if (distToCenter < minDistToCenter)
+                                {
+                                    minDistToCenter = distToCenter;
+                                    arrowTip = new PointF(px, py);
+                                }
+                            }
+                        }
+                    }
+
+                    // Calculate angle from ring center to arrow tip
+                    double dx = arrowTip.X - region.Center.X;
+                    double dy = arrowTip.Y - region.Center.Y;
+                    double finalAngle = Math.Atan2(dy, dx) * 180.0 / Math.PI;
+                    if (finalAngle < 0) finalAngle += 360;
+
+                    Log($"  [TemplateMatch] Best match: score={bestScore:F3}, rotation={bestRotation:F1}°");
+                    Log($"  [TemplateMatch] Match center: ({bestMatchCenter.X:F0},{bestMatchCenter.Y:F0}), Arrow tip: ({arrowTip.X:F0},{arrowTip.Y:F0})");
+                    Log($"  [TemplateMatch] Arrow direction: atan2({dy:F0},{dx:F0}) = {finalAngle:F1}°");
+
+                    var matchResult = new ArrowMatchResult
+                    {
+                        IsFound = true,
+                        Score = bestScore,
+                        Angle = finalAngle,
+                        Center = arrowTip  // Use arrow TIP instead of match center
+                    };
+
+                    LastTemplateMatchResult = matchResult;
+                    return (finalAngle, null, matchResult, templateType);
+                }
+
+                Log($"  [TemplateMatch] No match found (best score={bestScore:F3} < 0.4)");
+                LastTemplateMatchResult = null;
+                return (null, $"Template match score too low: {bestScore:F3}", null, templateType);
+            }
+            finally
             {
-                LastTemplateMatchResult = bestResult;
-                // Calculate angle from center to matched arrow
-                double angle = Math.Atan2(bestResult.Center.Y - region.Center.Y, bestResult.Center.X - region.Center.X);
-                return (angle * 180 / Math.PI, null, bestResult, bestTemplateType);
+                activeTemplate?.Dispose();
             }
-
-            LastTemplateMatchResult = null;
-            return (null, errors.TrimEnd(' ', ';'), null, "");
         }
 
         // Store last detected arrow contour for visualization
@@ -1185,8 +1834,34 @@ namespace CameraMaui.RingCode
                 // Calculate elongation ratio (tip-base distance vs sqrt(area))
                 double elongation = (maxTipDist - minBaseDist) / Math.Sqrt(area);
 
+                // Calculate convexity defects for Y-shape detection
+                double maxDefectDepth = 0;
+                try
+                {
+                    using var hullIndices = new Mat();
+                    CvInvoke.ConvexHull(contour, hullIndices, false, false);
+                    if (hullIndices.Rows >= 4)
+                    {
+                        using var defects = new Mat();
+                        CvInvoke.ConvexityDefects(contour, hullIndices, defects);
+                        if (!defects.IsEmpty && defects.Rows > 0)
+                        {
+                            var defectData = new int[defects.Rows * 4];
+                            defects.CopyTo(defectData);
+                            for (int d = 0; d < defects.Rows; d++)
+                            {
+                                double depth = defectData[d * 4 + 3] / 256.0;
+                                if (depth > maxDefectDepth) maxDefectDepth = depth;
+                            }
+                        }
+                    }
+                }
+                catch { /* Ignore defect errors */ }
+
+                double defectRatio = maxDefectDepth / Math.Sqrt(area);
+
                 // Calculate angle from center to BASE point (closest point) - this is the arrow direction
-                // Use image coordinate convention: Y increases downward, so 0°=right, 90°=down, 180°=left, 270°=up
+                // Image coords: 0°=right, 90°=down (clockwise)
                 double angle = Math.Atan2(basePoint.Y - cy, basePoint.X - cx) * 180.0 / Math.PI;
                 if (angle < 0) angle += 360;
 
@@ -1197,26 +1872,48 @@ namespace CameraMaui.RingCode
                 double baseScore = CalculateArrowScore(solidity, centroidDistRatio, tipDistRatio,
                     area, outerR, tipPointsOutward, elongation);
 
-                // Combined score: shape match is weighted heavily
+                // Combined score: low solidity is the PRIMARY indicator of Y-arrow
+                // Y-arrows have distinct low solidity (0.4-0.65) that data marks don't have
                 double score;
+
+                // Primary indicator: VERY LOW solidity (< 0.60) strongly suggests Y-arrow
+                bool hasVeryLowSolidity = solidity < 0.60;
+
                 if (shapeMatchScore >= 0.7)
                 {
-                    // Good shape match - trust it heavily
-                    score = baseScore * 0.3 + shapeMatchScore * 0.7;
+                    // Good shape match - this IS the arrow, give guaranteed high score
+                    score = Math.Max(0.90, baseScore * 0.2 + shapeMatchScore * 0.8 + 0.15);
+                }
+                else if (hasVeryLowSolidity)
+                {
+                    // Very low solidity is a strong Y-shape indicator even without good shapeMatch
+                    // This handles cases where template matching fails but solidity is clearly Y-like
+                    double solidityBonus = (0.60 - solidity) * 0.5;  // up to 0.10 bonus for solidity=0.40
+                    score = Math.Max(0.75, baseScore * 0.5 + 0.30 + solidityBonus);
+                }
+                else if (defectRatio >= 0.20 && solidity < 0.90 && solidity >= 0.60)
+                {
+                    // Medium-high defect ratio with medium solidity indicates Y-shape
+                    // This catches Y-arrows that appear more solid due to thresholding
+                    double defectBoostScore = Math.Min(0.75, 0.55 + defectRatio * 0.6);
+                    score = Math.Max(defectBoostScore, baseScore * 0.6);
                 }
                 else if (shapeMatchScore >= 0.5)
                 {
                     // Medium shape match - balanced weighting
-                    score = baseScore * 0.5 + shapeMatchScore * 0.5;
+                    score = baseScore * 0.4 + shapeMatchScore * 0.6;
                 }
                 else
                 {
-                    // Poor shape match - use base score but penalize
-                    score = baseScore * 0.8;
+                    // Poor shape match AND high solidity - likely a data mark, not arrow
+                    // Cap the max score
+                    score = Math.Min(0.65, baseScore * 0.6);
                 }
 
                 // PENALTY for very small contours - likely noise, not real arrow
                 double minExpectedArea = outerR * outerR * 0.02;  // ~2% of ring area
+                double maxExpectedArea = outerR * outerR * 0.04;  // ~4% of ring area
+
                 if (area < minExpectedArea && shapeMatchScore < 0.7)
                 {
                     double areaRatio = area / minExpectedArea;
@@ -1226,7 +1923,19 @@ namespace CameraMaui.RingCode
                     score -= areaPenalty;
                 }
 
-                Log($"    Contour {i}: area={area:F0}, solidity={solidity:F3}, centroid={centroidDistRatio:F2}R, tip={tipDistRatio:F2}R, angle={angle:F0}°, shapeMatch={shapeMatchScore:F2}, score={score:F2}");
+                // PENALTY for oversized contours - likely merged data marks, not Y-arrow
+                if (area > maxExpectedArea)
+                {
+                    double oversizeRatio = area / maxExpectedArea;
+                    double oversizePenalty = 0.30 * (oversizeRatio - 1.0);
+                    if (oversizeRatio > 1.5)
+                        oversizePenalty += 0.20;
+                    if (hasVeryLowSolidity && oversizeRatio > 1.2)
+                        oversizePenalty += 0.15;
+                    score -= oversizePenalty;
+                }
+
+                Log($"    Contour {i}: area={area:F0}, solidity={solidity:F3}, defect={defectRatio:F2}, centroid={centroidDistRatio:F2}R, tip={tipDistRatio:F2}R, angle={angle:F0}°, shapeMatch={shapeMatchScore:F2}, score={score:F2}");
 
                 if (score > 0.1)
                 {
@@ -1236,98 +1945,9 @@ namespace CameraMaui.RingCode
                 }
             }
 
-            // === Y-SHAPE DETECTION: Find pairs of nearby contours ===
-            // Y-shaped arrow may be split into two branches - detect by finding adjacent pairs
-            // Relaxed conditions to handle various arrow shapes
-            var yShapeCandidates = new List<(double score, double angle, double combinedArea,
-                VectorOfPoint contour1, VectorOfPoint contour2, PointF basePoint, PointF tipPoint)>();
-
-            for (int i = 0; i < allCandidates.Count; i++)
-            {
-                for (int j = i + 1; j < allCandidates.Count; j++)
-                {
-                    var c1 = allCandidates[i];
-                    var c2 = allCandidates[j];
-
-                    // Both contours must have reasonably HIGH solidity (individual branches are solid)
-                    if (c1.solidity < 0.80 || c2.solidity < 0.80) continue;
-
-                    // Both should have similar area (arrow branches are roughly symmetric)
-                    double areaRatio = Math.Min(c1.area, c2.area) / Math.Max(c1.area, c2.area);
-                    if (areaRatio < 0.35) continue;
-
-                    // Both should be reasonably small (arrow branches are medium sized)
-                    double maxBranchArea = outerR * outerR * 0.07;  // Each branch < 7% of ring
-                    if (c1.area > maxBranchArea || c2.area > maxBranchArea) continue;
-
-                    // Check angle difference (Y-shape branches are ~15-30° apart)
-                    // Expanded range to catch various Y-arrow orientations
-                    double angleDiff = Math.Abs(c1.angle - c2.angle);
-                    if (angleDiff > 180) angleDiff = 360 - angleDiff;
-
-                    if (angleDiff >= 15 && angleDiff <= 26)  // Optimized range
-                    {
-                        // Check if both are at similar distance from center
-                        // Y-shape may have one branch pointing outward (tip) and one inward
-                        double distDiff = Math.Abs(c1.centroidDistRatio - c2.centroidDistRatio);
-                        if (distDiff > 0.25) continue;
-
-                        // Average centroid should be reasonable (0.58-0.80R)
-                        double avgDist = (c1.centroidDistRatio + c2.centroidDistRatio) / 2;
-                        if (avgDist < 0.58 || avgDist > 0.80) continue;
-
-                        // Both must be within wider range (0.50-0.90R)
-                        if (c1.centroidDistRatio < 0.50 || c1.centroidDistRatio > 0.90) continue;
-                        if (c2.centroidDistRatio < 0.50 || c2.centroidDistRatio > 0.90) continue;
-
-                        // Skip if BOTH branches have high solidity (>0.92), likely data marks not arrow
-                        // Y-shape arrow branches should have moderate solidity (0.6-0.90)
-                        if (c1.solidity > 0.92 && c2.solidity > 0.92) continue;
-
-                        double avgCentroidDist = (c1.centroidDistRatio + c2.centroidDistRatio) / 2;
-
-                        // Combined area should be reasonable for arrow
-                        double combinedArea = c1.area + c2.area;
-                        double expectedArea = outerR * outerR * 0.03;
-                        if (combinedArea < expectedArea * 0.3 || combinedArea > expectedArea * 3) continue;
-
-                        // Calculate average angle
-                        double avgAngle = (c1.angle + c2.angle) / 2;
-                        if (Math.Abs(c1.angle - c2.angle) > 180)
-                            avgAngle = (avgAngle + 180) % 360;
-
-                        // Y-shape score - HIGH base score because Y-pair detection is reliable
-                        // Y-pair matching (two branches at 15-26° apart) is more specific than single contour
-                        double pairScore = 0.98;  // High base - Y-pair is reliable
-                        if (angleDiff >= 17 && angleDiff <= 21) pairScore += 0.02;  // Ideal angle ~18-20°
-                        if (avgCentroidDist >= 0.62 && avgCentroidDist <= 0.70) pairScore += 0.01;
-
-                        // Use midpoint as base
-                        var midBase = new PointF(
-                            (c1.basePoint.X + c2.basePoint.X) / 2,
-                            (c1.basePoint.Y + c2.basePoint.Y) / 2);
-
-                        // Use midpoint of both branch's actual tipPoints (furthest from center)
-                        var yShapeTipPoint = new PointF(
-                            (c1.tipPoint.X + c2.tipPoint.X) / 2,
-                            (c1.tipPoint.Y + c2.tipPoint.Y) / 2);
-
-                        Log($"    Y-pair: {c1.angle:F0}° + {c2.angle:F0}° = {avgAngle:F0}°, " +
-                            $"diff={angleDiff:F0}°, dist={avgCentroidDist:F2}R, score={pairScore:F2}");
-
-                        yShapeCandidates.Add((pairScore, avgAngle, combinedArea,
-                            c1.contour, c2.contour, midBase, yShapeTipPoint));
-                    }
-                }
-            }
-
-            // Always add Y-shape pairs - they have high reliability (synced with TestArrowDetection)
-            foreach (var yc in yShapeCandidates)
-            {
-                // Use yc.tipPoint (calculated at outer radius in avgAngle direction) for correct visualization
-                allCandidates.Add((yc.score, 0.5, yc.angle, yc.combinedArea, 0.7, 0.85,
-                    1.5, yc.contour1, yc.contour2, new PointF(0, 0), yc.basePoint, yc.tipPoint, true, "Y-Shape"));
-            }
+            // === Y-SHAPE DETECTION: DISABLED due to high false positive rate ===
+            // Adjacent data marks (15° apart) were incorrectly being detected as Y-pairs
+            // Rely on single-contour detection with low solidity instead
 
             // Cleanup
             dataMask.Dispose();
@@ -2198,12 +2818,15 @@ namespace CameraMaui.RingCode
                 string checkParityNum = temp.Substring(46, 2);
 
                 // Check parity
-                if (checkParityNum == "00" || checkParityNum == "11" || !CheckParity(data, checkParityNum))
+                bool parityValid = checkParityNum != "00" && checkParityNum != "11" && CheckParity(data, checkParityNum);
+                bool bccValid = ValidateBCC(temp);
+
+                Log($"    Binary: {temp}");
+                Log($"    Parity: {checkParityNum} (valid={parityValid}), BCC valid={bccValid}");
+
+                if (!parityValid && !bccValid)
                 {
-                    if (!ValidateBCC(temp))
-                    {
-                        return "-1";
-                    }
+                    return "-1";
                 }
 
                 // Extract fields
@@ -2698,12 +3321,15 @@ namespace CameraMaui.RingCode
                 var cropped = source.Clone();
                 source.ROI = Rectangle.Empty;
 
-                // Calculate actual arrow angle from center to arrow tip
+                // Calculate arrow angle from TemplateMatchCenter (arrow tip position)
+                // This is the same calculation used in debug image
                 double actualArrowAngle;
-                if (result.ArrowTip != PointF.Empty)
+                if (result.TemplateMatchCenter.HasValue && result.TemplateMatchCenter.Value != PointF.Empty)
                 {
-                    actualArrowAngle = Math.Atan2(result.ArrowTip.Y - result.Center.Y,
-                                                   result.ArrowTip.X - result.Center.X) * 180.0 / Math.PI;
+                    double dx = result.TemplateMatchCenter.Value.X - result.Center.X;
+                    double dy = result.TemplateMatchCenter.Value.Y - result.Center.Y;
+                    actualArrowAngle = Math.Atan2(dy, dx) * 180.0 / Math.PI;
+                    if (actualArrowAngle < 0) actualArrowAngle += 360;
                 }
                 else
                 {
@@ -2715,6 +3341,11 @@ namespace CameraMaui.RingCode
                 float ringCenterInCroppedY = (float)(result.Center.Y - y);
 
                 // Rotate to make arrow point right (0 degrees)
+                // Arrow is at angle A (in image coords where Y is down)
+                // GetRotationMatrix2D: positive angle = counter-clockwise in math coords
+                // In IMAGE coords (Y-down), positive angle appears CLOCKWISE
+                // To rotate arrow from A° to 0°: we need to rotate CW by A° (which is +A in GetRotationMatrix2D)
+                // This matches TestArrowDetection logic: rotationAngle = 0 - A, then -rotationAngle = A
                 double rotationNeeded = actualArrowAngle;
                 var rotationMat = new Mat();
                 CvInvoke.GetRotationMatrix2D(new PointF(ringCenterInCroppedX, ringCenterInCroppedY), rotationNeeded, 1.0, rotationMat);
@@ -2792,7 +3423,7 @@ namespace CameraMaui.RingCode
                     CvInvoke.Line(output, new Point(x1, y1), new Point(x2, y2), lineColor, 1);
                 }
 
-                // Draw arrow indicator pointing RIGHT (at 0°)
+                // Draw arrow indicator pointing RIGHT (at 0°) - because image is ROTATED to align arrow
                 var arrowColor = new MCvScalar(0, 255, 255);  // Yellow
                 int arrowX = (int)(cx + scaledOuterR * 0.85);
                 CvInvoke.ArrowedLine(output, new Point(cx, cy), new Point(arrowX, cy),
@@ -2812,6 +3443,30 @@ namespace CameraMaui.RingCode
                     {
                         CvInvoke.PutText(output, result.BinaryString.Substring(24),
                             new Point(10, outputSize - 15), FontFace.HersheySimplex, 0.35, new MCvScalar(255, 255, 255), 1);
+                    }
+                }
+
+                // Save debug image if DebugOutputDir is set
+                if (!string.IsNullOrEmpty(DebugOutputDir))
+                {
+                    try
+                    {
+                        Directory.CreateDirectory(DebugOutputDir);
+                        string timestamp = DateTime.Now.ToString("HHmmss_fff");
+
+                        // Add rotation info text
+                        CvInvoke.PutText(output, $"Arrow: {actualArrowAngle:F1} deg", new Point(10, outputSize - 60),
+                            FontFace.HersheySimplex, 0.4, new MCvScalar(0, 255, 255), 1);
+                        CvInvoke.PutText(output, $"Rotation: {rotationNeeded:F1} deg", new Point(10, outputSize - 80),
+                            FontFace.HersheySimplex, 0.4, new MCvScalar(255, 255, 0), 1);
+
+                        string debugPath = Path.Combine(DebugOutputDir, $"rotated_debug_{timestamp}.png");
+                        output.Save(debugPath);
+                        Log($"  [DEBUG] Saved rotated image: {debugPath}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"  [DEBUG] Failed to save rotated debug image: {ex.Message}");
                     }
                 }
 
@@ -2847,10 +3502,10 @@ namespace CameraMaui.RingCode
                 source.ROI = Rectangle.Empty;
 
                 // Calculate actual arrow angle from center to arrow tip
+                // Image coords: angles clockwise from right (0°=right, 90°=down)
                 double actualArrowAngle;
                 if (result.ArrowTip != PointF.Empty)
                 {
-                    // Use actual arrow tip position
                     actualArrowAngle = Math.Atan2(result.ArrowTip.Y - result.Center.Y,
                                                    result.ArrowTip.X - result.Center.X) * 180.0 / Math.PI;
                 }
@@ -2861,7 +3516,7 @@ namespace CameraMaui.RingCode
                 }
 
                 // Calculate rotation angle to make arrow point right (0 degrees)
-                // If arrow is at angle θ, rotate image by +θ to bring arrow to 0°
+                // GetRotationMatrix2D rotates counter-clockwise, so use positive angle
                 double rotationNeeded = actualArrowAngle;
 
                 // Calculate ring center position in CROPPED image coordinates
@@ -2897,3 +3552,4 @@ namespace CameraMaui.RingCode
         }
     }
 }
+#endif

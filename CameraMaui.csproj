@@ -7,8 +7,9 @@
 	</ItemGroup>
 
 	<PropertyGroup>
-		<!-- Target only Android and Windows -->
-		<TargetFrameworks>net8.0-android;net8.0-windows10.0.19041.0</TargetFrameworks>
+		<!-- Upgraded to .NET 8 for Emgu.CV MAUI support -->
+		<TargetFrameworks>net8.0-android;net8.0-ios;net8.0-maccatalyst</TargetFrameworks>
+		<TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('windows'))">$(TargetFrameworks);net8.0-windows10.0.19041.0</TargetFrameworks>
 		<OutputType>Exe</OutputType>
 		<RootNamespace>CameraMaui</RootNamespace>
 		<UseMaui>true</UseMaui>
@@ -26,10 +27,12 @@
 		<ApplicationDisplayVersion>1.0</ApplicationDisplayVersion>
 		<ApplicationVersion>1</ApplicationVersion>
 
-		<!-- Platform versions -->
+		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'ios'">11.0</SupportedOSPlatformVersion>
+		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'maccatalyst'">13.1</SupportedOSPlatformVersion>
 		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android'">34.0</SupportedOSPlatformVersion>
 		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">10.0.17763.0</SupportedOSPlatformVersion>
 		<TargetPlatformMinVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">10.0.17763.0</TargetPlatformMinVersion>
+		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'tizen'">6.5</SupportedOSPlatformVersion>
 		<AllowUnsafeBlocks>True</AllowUnsafeBlocks>
 	</PropertyGroup>
 
@@ -42,13 +45,21 @@
 
 		<!-- Images -->
 		<MauiImage Include="Resources\Images\*" />
+		<MauiImage Update="Resources\Images\dotnet_bot.svg" BaseSize="168,208" />
 
 		<!-- Custom Fonts -->
 		<MauiFont Include="Resources\Fonts\*" />
 
-		<!-- Raw Assets -->
+		<!-- Raw Assets (also remove the "Resources\Raw" prefix) -->
 		<MauiAsset Include="Resources\Raw\**" LogicalName="%(RecursiveDir)%(Filename)%(Extension)" />
 	</ItemGroup>
+
+	<ItemGroup>
+	  <None Remove="Platforms\Android\Resources\values\network_security_config.xml" />
+	</ItemGroup>
+
+	<!-- COM Reference removed - not supported in .NET Core -->
+	<!-- If needed, use CsWin32 or manual P/Invoke instead -->
 
 	<ItemGroup>
 	  <None Remove="nul" />
@@ -59,22 +70,19 @@
 		<PackageReference Include="Camera.MAUI" Version="1.5.1" />
 		<PackageReference Include="Microsoft.Extensions.Logging.Debug" Version="8.0.0" />
 		<PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
-		<PackageReference Include="SkiaSharp" Version="2.88.8" />
-		<PackageReference Include="SkiaSharp.Views.Maui.Controls" Version="2.88.8" />
+		<PackageReference Include="SkiaSharp" Version="3.0.0-preview.2.1" />
+		<PackageReference Include="SkiaSharp.Views.Maui.Controls" Version="3.0.0-preview.2.1" />
+		<PackageReference Include="Emgu.CV" Version="4.9.0.5494" />
 	</ItemGroup>
 
-	<!-- Android Emgu.CV -->
+	<!-- Android Emgu.CV (MAUI version) -->
 	<ItemGroup Condition="$(TargetFramework.Contains('-android'))">
-		<PackageReference Include="Emgu.CV" Version="4.9.0.5494" />
-		<PackageReference Include="Emgu.CV.Bitmap" Version="4.9.0.5494" />
-		<PackageReference Include="Emgu.CV.runtime.maui.mini.android" Version="4.9.0.5494" />
+	  <PackageReference Include="Emgu.CV.runtime.maui.mini.android" Version="4.9.0.5494" />
 	</ItemGroup>
 
 	<!-- Windows Emgu.CV -->
 	<ItemGroup Condition="$(TargetFramework.Contains('-windows'))">
-		<PackageReference Include="Emgu.CV" Version="4.9.0.5494" />
-		<PackageReference Include="Emgu.CV.Bitmap" Version="4.9.0.5494" />
-		<PackageReference Include="Emgu.CV.runtime.windows" Version="4.9.0.5494" />
+	  <PackageReference Include="Emgu.CV.runtime.windows" Version="4.9.0.5494" />
 	</ItemGroup>
 
 </Project>

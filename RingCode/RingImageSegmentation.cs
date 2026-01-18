@@ -1,3 +1,4 @@
+#if ANDROID || WINDOWS
 using Emgu.CV;
 using Emgu.CV.CvEnum;
 using Emgu.CV.Structure;
@@ -71,6 +72,10 @@ namespace CameraMaui.RingCode
 
         // Logging
         public static Action<string> Log { get; set; } = (msg) => System.Diagnostics.Debug.WriteLine($"[Segmentation] {msg}");
+
+        // Debug: store last edge points for visualization
+        private List<PointF> _lastOuterEdgePoints = new List<PointF>();
+        private List<PointF> _lastInnerEdgePoints = new List<PointF>();
 
         /// <summary>
         /// Main segmentation method
@@ -322,16 +327,50 @@ namespace CameraMaui.RingCode
                 debugLog.AppendLine($"Mean brightness: {meanGray:F1}");
                 debugLog.AppendLine($"Otsu threshold: {otsuThresh:F1}");
 
-                // Step 3: Morphological cleaning
-                var kernel = CvInvoke.GetStructuringElement(ElementShape.Ellipse, new System.Drawing.Size(5, 5), new Point(-1, -1));
-                CvInvoke.MorphologyEx(binary, binary, MorphOp.Close, kernel, new Point(-1, -1), 2, BorderType.Default, new MCvScalar(0));
-                CvInvoke.MorphologyEx(binary, binary, MorphOp.Open, kernel, new Point(-1, -1), 1, BorderType.Default, new MCvScalar(0));
+                // Step 3: Fill holes in binary image
+                // Use flood fill from corners to fill background, then invert
+                var filled = binary.Clone();
+                var mask = new Image<Gray, byte>(filled.Width + 2, filled.Height + 2);
 
-                // Step 4: Blob analysis - find connected components
+                // Flood fill from (0,0) to mark background
+                var fillRect = new Rectangle();
+                CvInvoke.FloodFill(filled, mask, new Point(0, 0), new MCvScalar(255),
+                    out fillRect, new MCvScalar(0), new MCvScalar(0), Emgu.CV.CvEnum.Connectivity.FourConnected, FloodFillType.Default);
+
+                // Invert: background becomes black, filled ring becomes white
+                var filledRing = new Image<Gray, byte>(original.Size);
+                CvInvoke.BitwiseNot(filled, filledRing);
+                CvInvoke.BitwiseOr(filledRing, binary, filledRing); // Combine with original binary
+                filledRing.Save(Path.Combine(DebugOutputPath, "03_filled.png"));
+                debugLog.AppendLine($"Fill holes completed");
+
+                // Step 4: Use filled mask to extract ring region from original
+                var maskedOriginal = new Image<Gray, byte>(original.Size);
+                CvInvoke.BitwiseAnd(original, filledRing, maskedOriginal);
+                maskedOriginal.Save(Path.Combine(DebugOutputPath, "04_masked_original.png"));
+
+                // Step 5: Otsu on masked region to get black areas (data marks)
+                // Only process pixels inside the ring mask
+                var ringRegionBinary = new Image<Gray, byte>(original.Size);
+                double otsuThresh2 = CvInvoke.Threshold(maskedOriginal, ringRegionBinary, 0, 255, ThresholdType.Otsu | ThresholdType.BinaryInv);
+                // Keep only pixels inside the ring mask
+                CvInvoke.BitwiseAnd(ringRegionBinary, filledRing, ringRegionBinary);
+                ringRegionBinary.Save(Path.Combine(DebugOutputPath, "05_ring_binary.png"));
+                debugLog.AppendLine($"Ring region Otsu threshold: {otsuThresh2:F1}");
+
+                // Save a clean copy of filledRing BEFORE morphological operations (for contour fitting later)
+                var filledRingClean = filledRing.Clone();
+
+                // Step 6: Morphological cleaning (for blob analysis only)
+                var kernel = CvInvoke.GetStructuringElement(ElementShape.Ellipse, new System.Drawing.Size(5, 5), new Point(-1, -1));
+                CvInvoke.MorphologyEx(filledRing, filledRing, MorphOp.Close, kernel, new Point(-1, -1), 2, BorderType.Default, new MCvScalar(0));
+                CvInvoke.MorphologyEx(filledRing, filledRing, MorphOp.Open, kernel, new Point(-1, -1), 1, BorderType.Default, new MCvScalar(0));
+
+                // Step 7: Blob analysis on filled ring - find connected components
                 var labels = new Mat();
                 var stats = new Mat();
                 var centroids = new Mat();
-                int numLabels = CvInvoke.ConnectedComponentsWithStats(binary, labels, stats, centroids);
+                int numLabels = CvInvoke.ConnectedComponentsWithStats(filledRing, labels, stats, centroids);
 
                 debugLog.AppendLine($"Found {numLabels - 1} blobs (excluding background)");
 
@@ -416,8 +455,8 @@ namespace CameraMaui.RingCode
                         5, new MCvScalar(0, 255, 255), -1);
                 }
 
-                blobDebug.Save(Path.Combine(DebugOutputPath, "03_blob_analysis.png"));
-                binary.Save(Path.Combine(DebugOutputPath, "04_binary_cleaned.png"));
+                blobDebug.Save(Path.Combine(DebugOutputPath, "06_blob_analysis.png"));
+                filledRing.Save(Path.Combine(DebugOutputPath, "06_filled_cleaned.png"));
 
                 // Check if blob analysis found a valid ring
                 if (bestLabel < 0 || bestRadius < minDim * 0.05f)
@@ -434,68 +473,237 @@ namespace CameraMaui.RingCode
 
                 Log($"Found ring blob: center=({bestCenter.X:F0},{bestCenter.Y:F0}), r={bestRadius:F0}");
 
-                // Step 6: HALCON Metrology style circle fitting - refine center and radius using edge detection
+                // Step 8: Circle fitting - find DATA RING outer boundary
+                // Use radial scan on ringRegionBinary to find outermost data marks
                 debugLog.AppendLine();
-                debugLog.AppendLine("=== Metrology Circle Fitting ===");
+                debugLog.AppendLine("=== Data Ring Circle Fitting ===");
 
-                var (refinedCenter, refinedOuterR, fitSuccess) = FitCircleMetrology(original, bestCenter, bestRadius, true);
-                if (fitSuccess)
+                // Save filledRingClean for debugging
+                filledRingClean.Save(Path.Combine(DebugOutputPath, "03b_filled_clean.png"));
+
+                // Step 8a: Radial scan on ringRegionBinary to find outermost DATA points
+                // Strategy: scan from CENTER outward, find MAX radius where white pixel exists
+                // This finds the outer edge of data marks without being affected by image edge noise
+                int numAngles = 72; // Sample every 5 degrees
+                float searchOuterR = bestRadius * 1.05f; // Search outer limit
+                float centerHoleR = bestRadius * 0.45f; // Estimated center hole outer edge
+                var outerDataPoints = new List<PointF>();
+                _lastOuterEdgePoints.Clear();
+
+                debugLog.AppendLine($"Outer scan: searchOuter={searchOuterR:F0}, centerHole={centerHoleR:F0}");
+
+                for (int a = 0; a < numAngles; a++)
                 {
-                    debugLog.AppendLine($"Outer fit: SUCCESS center=({refinedCenter.X:F1},{refinedCenter.Y:F1}), r={refinedOuterR:F1}");
-                    bestCenter = refinedCenter;
-                    bestRadius = refinedOuterR;
-                    Log($"Metrology refined: center=({bestCenter.X:F1},{bestCenter.Y:F1}), r={bestRadius:F1}");
+                    double angle = a * 2 * Math.PI / numAngles;
+                    float cosA = (float)Math.Cos(angle);
+                    float sinA = (float)Math.Sin(angle);
+
+                    // Scan from CENTER outward, find the OUTERMOST white pixel (data mark)
+                    // Skip the center hole area, only look in the data ring area
+                    float maxWhiteR = 0;
+                    bool passedBlackGap = false; // Track if we've passed the gap between center and data ring
+
+                    for (float r = centerHoleR; r < searchOuterR; r += 2)
+                    {
+                        int px = (int)(bestCenter.X + r * cosA);
+                        int py = (int)(bestCenter.Y + r * sinA);
+
+                        if (px < 0 || px >= ringRegionBinary.Width || py < 0 || py >= ringRegionBinary.Height)
+                            break;
+
+                        byte pixel = ringRegionBinary.Data[py, px, 0];
+
+                        if (pixel < 127) // BLACK pixel (ring background)
+                        {
+                            passedBlackGap = true;
+                        }
+                        else if (pixel > 127 && passedBlackGap) // WHITE pixel after black gap = data mark
+                        {
+                            maxWhiteR = r;
+                        }
+                    }
+
+                    if (maxWhiteR > 0)
+                    {
+                        float ptX = bestCenter.X + maxWhiteR * cosA;
+                        float ptY = bestCenter.Y + maxWhiteR * sinA;
+                        outerDataPoints.Add(new PointF(ptX, ptY));
+                        _lastOuterEdgePoints.Add(new PointF(ptX, ptY));
+                    }
+                }
+
+                debugLog.AppendLine($"Radial scan found {outerDataPoints.Count} outer data points");
+
+                // Step 8b: Fit circle to outer data points
+                float metroOuterR = bestRadius;
+                if (outerDataPoints.Count >= 20)
+                {
+                    // Calculate distances from center to each point
+                    var distances = outerDataPoints.Select(p =>
+                        (float)Math.Sqrt(Math.Pow(p.X - bestCenter.X, 2) + Math.Pow(p.Y - bestCenter.Y, 2))).ToList();
+
+                    // Use 90th percentile as outer radius (to ensure circle doesn't cut into data marks)
+                    // This ensures the circle "hugs" the outermost data marks
+                    distances.Sort();
+                    int p90Index = (int)(distances.Count * 0.90);
+                    float outerR_p90 = distances[Math.Min(p90Index, distances.Count - 1)];
+                    float medianR = distances[distances.Count / 2];
+                    metroOuterR = outerR_p90;
+
+                    debugLog.AppendLine($"Outer radius: p90={outerR_p90:F1}, median={medianR:F1} (from {outerDataPoints.Count} points)");
+
+                    // Also try least squares fit for better center (but keep p90 radius)
+                    var fitResult = FitCircleLeastSquares(outerDataPoints);
+                    if (fitResult != null)
+                    {
+                        float fitCenterDist = (float)Math.Sqrt(
+                            Math.Pow(fitResult.Value.cx - bestCenter.X, 2) +
+                            Math.Pow(fitResult.Value.cy - bestCenter.Y, 2));
+
+                        // Only use fitted CENTER if it's close to blob center (within 5%)
+                        // But keep p90 radius (don't use fitted radius - it's unreliable)
+                        if (fitCenterDist < bestRadius * 0.05f)
+                        {
+                            bestCenter = new PointF((float)fitResult.Value.cx, (float)fitResult.Value.cy);
+                            debugLog.AppendLine($"Using fitted center: ({bestCenter.X:F1},{bestCenter.Y:F1}), keeping p90 r={metroOuterR:F1}");
+                        }
+                        else
+                        {
+                            debugLog.AppendLine($"Fitted center too far ({fitCenterDist:F1}), using blob center, p90 r={metroOuterR:F1}");
+                        }
+                    }
+                    else
+                    {
+                        debugLog.AppendLine($"Circle fit failed, using p90 r={metroOuterR:F1}");
+                    }
                 }
                 else
                 {
-                    debugLog.AppendLine($"Outer fit: FAILED, using blob r={bestRadius:F0}");
+                    debugLog.AppendLine($"Not enough outer points ({outerDataPoints.Count}), using blob r={bestRadius:F0}");
                 }
 
-                // Estimate inner radius and fit it too
-                float estimatedInnerR = bestRadius * 0.4f;
-                var (innerCenter, refinedInnerR, innerFitSuccess) = FitCircleMetrology(original, bestCenter, estimatedInnerR, false);
-                if (innerFitSuccess)
+                Log($"Data ring outer: center=({bestCenter.X:F1},{bestCenter.Y:F1}), r={metroOuterR:F1}");
+
+                bestRadius = metroOuterR;
+
+                // Step 8c: Inner circle = find innermost data points
+                // Scan from center hole outward, find FIRST white pixel after black gap
+                var innerDataPoints = new List<PointF>();
+                _lastInnerEdgePoints.Clear();
+
+                debugLog.AppendLine($"Inner scan: from {centerHoleR:F0} to {metroOuterR:F0}");
+
+                for (int a = 0; a < numAngles; a++)
                 {
-                    debugLog.AppendLine($"Inner fit: SUCCESS r={refinedInnerR:F1}");
-                    estimatedInnerR = refinedInnerR;
+                    double angle = a * 2 * Math.PI / numAngles;
+                    float cosA = (float)Math.Cos(angle);
+                    float sinA = (float)Math.Sin(angle);
+
+                    // Scan from center hole edge outward, find first WHITE pixel after black gap
+                    float innerR_found = 0;
+                    bool passedBlackGap = false;
+
+                    for (float r = centerHoleR; r < metroOuterR; r += 2)
+                    {
+                        int px = (int)(bestCenter.X + r * cosA);
+                        int py = (int)(bestCenter.Y + r * sinA);
+
+                        if (px < 0 || px >= ringRegionBinary.Width || py < 0 || py >= ringRegionBinary.Height)
+                            continue;
+
+                        byte pixel = ringRegionBinary.Data[py, px, 0];
+
+                        if (pixel < 127) // BLACK pixel (ring background)
+                        {
+                            passedBlackGap = true;
+                        }
+                        else if (pixel > 127 && passedBlackGap) // First WHITE pixel after black = data mark inner edge
+                        {
+                            innerR_found = r;
+                            break;
+                        }
+                    }
+
+                    if (innerR_found > 0)
+                    {
+                        float ptX = bestCenter.X + innerR_found * cosA;
+                        float ptY = bestCenter.Y + innerR_found * sinA;
+                        innerDataPoints.Add(new PointF(ptX, ptY));
+                        _lastInnerEdgePoints.Add(new PointF(ptX, ptY));
+                    }
+                }
+
+                float metroInnerR = metroOuterR * 0.55f; // Default ratio
+                if (innerDataPoints.Count >= 20)
+                {
+                    var innerDistances = innerDataPoints.Select(p =>
+                        (float)Math.Sqrt(Math.Pow(p.X - bestCenter.X, 2) + Math.Pow(p.Y - bestCenter.Y, 2))).ToList();
+                    innerDistances.Sort();
+                    // Use 10th percentile for inner radius (so circle stays inside data marks)
+                    int p10Index = (int)(innerDistances.Count * 0.10);
+                    float innerR_p10 = innerDistances[Math.Max(p10Index, 0)];
+                    float innerMedianR = innerDistances[innerDistances.Count / 2];
+                    metroInnerR = innerR_p10;
+                    debugLog.AppendLine($"Inner radius: p10={innerR_p10:F1}, median={innerMedianR:F1} (from {innerDataPoints.Count} points)");
                 }
                 else
                 {
-                    debugLog.AppendLine($"Inner fit: FAILED, using estimated r={estimatedInnerR:F0}");
+                    debugLog.AppendLine($"Inner circle fallback: r={metroInnerR:F1} (ratio=0.55 of outer)");
                 }
 
-                float bestInnerRadius = estimatedInnerR;
-                float bestOuterRadius = bestRadius;
-                debugLog.AppendLine($"After Metrology: outerR={bestOuterRadius:F1}, innerR={bestInnerRadius:F1}");
-
-                // Step 7: Refine using radial scanning for data boundaries
-                var (innerR, outerR, dataOuterR) = FindWhiteRingBoundaries(original, bestCenter, bestOuterRadius);
-                debugLog.AppendLine($"Radial scan: innerR={innerR:F1}, outerR={outerR:F1}, dataOuterR={dataOuterR:F1}");
+                float bestInnerRadius = metroInnerR;
+                float bestOuterRadius = metroOuterR;
+                debugLog.AppendLine($"Final: outerR={bestOuterRadius:F1}, innerR={bestInnerRadius:F1}");
 
                 // Save debug log now
                 File.WriteAllText(Path.Combine(DebugOutputPath, "debug_log.txt"), debugLog.ToString());
 
-                // Validate and use refined values if reasonable
-                if (innerR > 10 && outerR > innerR && outerR < bestOuterRadius * 1.3f)
+                // Save final result visualization: ringRegionBinary (blob) + circles + edge points
+                try
                 {
-                    Log($"Refined ring: innerR={innerR:F0}, outerR={outerR:F0}, dataOuterR={dataOuterR:F0}");
+                    var finalDebug = ringRegionBinary.Convert<Bgr, byte>();
+
+                    // Draw inner edge points (cyan small circles)
+                    foreach (var pt in _lastInnerEdgePoints)
+                    {
+                        CvInvoke.Circle(finalDebug, new Point((int)pt.X, (int)pt.Y), 3, new MCvScalar(255, 255, 0), -1);
+                    }
+
+                    // Draw outer edge points (magenta small circles)
+                    foreach (var pt in _lastOuterEdgePoints)
+                    {
+                        CvInvoke.Circle(finalDebug, new Point((int)pt.X, (int)pt.Y), 3, new MCvScalar(255, 0, 255), -1);
+                    }
+
+                    // Draw inner circle (cyan)
+                    CvInvoke.Circle(finalDebug, new Point((int)bestCenter.X, (int)bestCenter.Y),
+                        (int)metroInnerR, new MCvScalar(255, 255, 0), 2);
+
+                    // Draw outer circle (magenta)
+                    CvInvoke.Circle(finalDebug, new Point((int)bestCenter.X, (int)bestCenter.Y),
+                        (int)metroOuterR, new MCvScalar(255, 0, 255), 2);
+
+                    // Draw center point (green)
+                    CvInvoke.Circle(finalDebug, new Point((int)bestCenter.X, (int)bestCenter.Y),
+                        5, new MCvScalar(0, 255, 0), -1);
+
+                    finalDebug.Save(Path.Combine(DebugOutputPath, "08_final_circles.png"));
+                    Log($"Final debug saved: 08_final_circles.png, outer={_lastOuterEdgePoints.Count}, inner={_lastInnerEdgePoints.Count}");
                 }
-                else
+                catch (Exception ex)
                 {
-                    // Use contour-based values
-                    innerR = bestInnerRadius;
-                    outerR = bestOuterRadius;
-                    dataOuterR = bestOuterRadius * 0.97f;
-                    Log($"Using contour values: innerR={innerR:F0}, outerR={outerR:F0}");
+                    Log($"Final debug save failed: {ex.Message}");
                 }
 
-                // Create region
+                Log($"Final ring: innerR={bestInnerRadius:F0}, outerR={bestOuterRadius:F0}");
+
+                // Create region using the data-fitted radii
                 var region = new RingRegion
                 {
                     Center = bestCenter,
-                    OuterRadius = dataOuterR,
-                    InnerRadius = innerR,
-                    BoundingBox = GetBoundingBox(bestCenter, outerR * 1.1f, original.Size),
+                    OuterRadius = bestOuterRadius,
+                    InnerRadius = bestInnerRadius,
+                    BoundingBox = GetBoundingBox(bestCenter, bestOuterRadius * 1.1f, original.Size),
                     MatchScore = bestScore * 100
                 };
 
@@ -1252,9 +1460,12 @@ namespace CameraMaui.RingCode
 
                 if (!inWhiteRing) continue;
 
-                // Phase 2: Find where white ring ends (transition to dark background)
+                // Phase 2: Find where white ring ends using gradient detection
+                // Look for significant brightness drop (edge detection approach)
                 float whiteEnd = 0;
                 int consecutiveDark = 0;
+                byte prevPixel = 255;
+                float lastBrightRadius = whiteStart;
 
                 for (float r = whiteStart; r < physicalRadius * 1.3f; r += 2)
                 {
@@ -1264,20 +1475,34 @@ namespace CameraMaui.RingCode
 
                     byte pixel = source.Data[y, x, 0];
 
+                    // Track last position where we saw bright pixels
+                    if (pixel > whiteThreshold)
+                    {
+                        lastBrightRadius = r;
+                        consecutiveDark = 0;
+                    }
+
+                    // Detect significant brightness DROP (gradient-based edge detection)
+                    int gradient = prevPixel - pixel;
+                    if (gradient > 40 && pixel < darkThreshold)
+                    {
+                        // Sharp edge found - this is likely the ring boundary
+                        whiteEnd = r - 4;
+                        break;
+                    }
+
                     if (pixel < darkThreshold)  // Dark pixel (adaptive)
                     {
                         consecutiveDark++;
-                        if (consecutiveDark > 15)  // Reduced from 20 for better detection
+                        if (consecutiveDark > 10)  // Tighter check
                         {
                             // This is the outer dark background
-                            whiteEnd = r - 30;  // Adjusted from -40
+                            whiteEnd = lastBrightRadius;  // Use last bright position, not current
                             break;
                         }
                     }
-                    else
-                    {
-                        consecutiveDark = 0;
-                    }
+
+                    prevPixel = pixel;
                 }
 
                 if (whiteEnd > whiteStart)
@@ -1289,20 +1514,26 @@ namespace CameraMaui.RingCode
 
             Log($"  Radial scan found {whiteRingStartRadii.Count} valid samples");
 
-            // Calculate ring boundaries using median for robustness
+            // Calculate ring boundaries
+            // Use median for inner (stable), but use 85th percentile for outer (to include all data marks)
             float innerRadius, outerRadius, dataOuterRadius;
             if (whiteRingStartRadii.Count >= 8)  // Reduced from 10 for more lenient detection
             {
                 whiteRingStartRadii.Sort();
                 whiteRingEndRadii.Sort();
 
+                // Inner radius: use median (stable detection)
                 innerRadius = whiteRingStartRadii[whiteRingStartRadii.Count / 2];
-                outerRadius = whiteRingEndRadii[whiteRingEndRadii.Count / 2];
 
-                // Data ring outer = 97% of white ring (arrow tip is at outer edge of data)
-                dataOuterRadius = innerRadius + (outerRadius - innerRadius) * 0.97f;
+                // Outer radius: use 85th percentile to include data marks at all angles
+                // Some angles may have obstructions, so don't use max, but use high percentile
+                int p85Index = (int)(whiteRingEndRadii.Count * 0.85);
+                outerRadius = whiteRingEndRadii[Math.Min(p85Index, whiteRingEndRadii.Count - 1)];
 
-                Log($"  White ring scan: inner={innerRadius:F0}, outer={outerRadius:F0}, dataOuter={dataOuterRadius:F0}");
+                // Data ring outer = 100% of detected white ring (not 97%, to include edge marks)
+                dataOuterRadius = outerRadius;
+
+                Log($"  White ring scan: inner={innerRadius:F0}, outer(p85)={outerRadius:F0}, dataOuter={dataOuterRadius:F0}");
             }
             else
             {
@@ -1478,29 +1709,13 @@ namespace CameraMaui.RingCode
             try
             {
                 int numSamples = 72; // Sample every 5 degrees
-                float searchRange = roughRadius * 0.2f; // Search ±20% of radius
-                float minSearchR = roughRadius - searchRange;
+                float searchRange = roughRadius * 0.3f; // Search ±30% of radius (not too wide)
+                float minSearchR = Math.Max(10, roughRadius - searchRange);
                 float maxSearchR = roughRadius + searchRange;
 
-                // Compute gradient magnitude using Sobel
-                var gradX = new Image<Gray, float>(source.Size);
-                var gradY = new Image<Gray, float>(source.Size);
-                var gradMag = new Image<Gray, float>(source.Size);
-
-                CvInvoke.Sobel(source, gradX, Emgu.CV.CvEnum.DepthType.Cv32F, 1, 0, 3);
-                CvInvoke.Sobel(source, gradY, Emgu.CV.CvEnum.DepthType.Cv32F, 0, 1, 3);
-
-                // Magnitude = sqrt(gx² + gy²)
-                var gradX2 = new Image<Gray, float>(source.Size);
-                var gradY2 = new Image<Gray, float>(source.Size);
-                CvInvoke.Multiply(gradX, gradX, gradX2);
-                CvInvoke.Multiply(gradY, gradY, gradY2);
-                CvInvoke.Add(gradX2, gradY2, gradMag);
-                CvInvoke.Sqrt(gradMag, gradMag);
-
-                // Collect edge points
+                // Collect edge points by finding outermost/innermost WHITE pixels
                 var edgePoints = new List<PointF>();
-                float gradThreshold = 30; // Minimum gradient to be considered an edge
+                byte whiteThreshold = 127; // Pixel is white if > 127
 
                 for (int i = 0; i < numSamples; i++)
                 {
@@ -1508,16 +1723,14 @@ namespace CameraMaui.RingCode
                     float cosA = (float)Math.Cos(angle);
                     float sinA = (float)Math.Sin(angle);
 
-                    // For OUTER edge: search from OUTSIDE inward (find first edge)
-                    // For INNER edge: search from INSIDE outward (find first edge)
                     float bestR = roughRadius;
                     bool found = false;
 
-                    int numSteps = (int)(searchRange * 2);
+                    int numSteps = (int)(maxSearchR - minSearchR);
 
                     if (isOuterEdge)
                     {
-                        // Search from outside inward
+                        // OUTER: Search from OUTSIDE inward, find FIRST WHITE pixel
                         for (int step = numSteps - 1; step >= 0; step--)
                         {
                             float r = minSearchR + step;
@@ -1527,18 +1740,20 @@ namespace CameraMaui.RingCode
                             if (px < 0 || px >= source.Width || py < 0 || py >= source.Height)
                                 continue;
 
-                            float grad = gradMag.Data[py, px, 0];
-                            if (grad > gradThreshold)
+                            byte pixelValue = source.Data[py, px, 0];
+                            if (pixelValue > whiteThreshold)
                             {
                                 bestR = r;
                                 found = true;
-                                break; // First significant edge from outside
+                                break; // First white pixel from outside = outermost point
                             }
                         }
                     }
                     else
                     {
-                        // Search from inside outward
+                        // INNER: Search from CENTER outward, find WHITE→BLACK transition
+                        // (inner circle boundary = where white center becomes black)
+                        bool wasWhite = false;
                         for (int step = 0; step < numSteps; step++)
                         {
                             float r = minSearchR + step;
@@ -1548,12 +1763,17 @@ namespace CameraMaui.RingCode
                             if (px < 0 || px >= source.Width || py < 0 || py >= source.Height)
                                 continue;
 
-                            float grad = gradMag.Data[py, px, 0];
-                            if (grad > gradThreshold)
+                            byte pixelValue = source.Data[py, px, 0];
+                            if (pixelValue > whiteThreshold)
                             {
+                                wasWhite = true;
+                            }
+                            else if (wasWhite)
+                            {
+                                // Transition from white to black = inner circle boundary
                                 bestR = r;
                                 found = true;
-                                break; // First significant edge from inside
+                                break;
                             }
                         }
                     }
@@ -1573,49 +1793,80 @@ namespace CameraMaui.RingCode
                     return (roughCenter, roughRadius, false);
                 }
 
-                // Least squares circle fitting
-                // Minimize sum of (x - a)² + (y - b)² - r² = 0
-                // Linearize: x² + y² = 2ax + 2by + (r² - a² - b²)
-                // Let c = r² - a² - b², solve for [a, b, c]
-                double sumX = 0, sumY = 0, sumX2 = 0, sumY2 = 0;
-                double sumXY = 0, sumX3 = 0, sumY3 = 0, sumX2Y = 0, sumXY2 = 0;
-                int n = edgePoints.Count;
+                // Iterative least squares with outlier removal (HALCON Metrology style)
+                var currentPoints = new List<PointF>(edgePoints);
+                double a = roughCenter.X, b = roughCenter.Y, fittedR = roughRadius;
+                int maxIterations = 5;
+                float outlierThreshold = 2.0f; // Remove points > 2 * stdDev from median
 
-                foreach (var pt in edgePoints)
+                Log($"  Metrology: Starting iterative fit with {currentPoints.Count} points");
+
+                for (int iter = 0; iter < maxIterations; iter++)
                 {
-                    double x = pt.X, y = pt.Y;
-                    double x2 = x * x, y2 = y * y;
-                    sumX += x; sumY += y;
-                    sumX2 += x2; sumY2 += y2;
-                    sumXY += x * y;
-                    sumX3 += x2 * x; sumY3 += y2 * y;
-                    sumX2Y += x2 * y; sumXY2 += x * y2;
+                    if (currentPoints.Count < 10)
+                    {
+                        Log($"  Metrology: Too few points after iteration {iter}");
+                        break;
+                    }
+
+                    // Fit circle with current points
+                    var fitResult = FitCircleLeastSquares(currentPoints);
+                    if (fitResult == null)
+                    {
+                        Log($"  Metrology: Fit failed at iteration {iter}");
+                        break;
+                    }
+
+                    a = fitResult.Value.cx;
+                    b = fitResult.Value.cy;
+                    fittedR = fitResult.Value.r;
+
+                    // Calculate distance of each point to fitted circle
+                    var distances = new List<double>();
+                    foreach (var pt in currentPoints)
+                    {
+                        double dist = Math.Abs(Math.Sqrt(Math.Pow(pt.X - a, 2) + Math.Pow(pt.Y - b, 2)) - fittedR);
+                        distances.Add(dist);
+                    }
+
+                    // Calculate median and stdDev
+                    distances.Sort();
+                    double median = distances[distances.Count / 2];
+                    double sumSq = 0;
+                    foreach (var d in distances) sumSq += (d - median) * (d - median);
+                    double stdDev = Math.Sqrt(sumSq / distances.Count);
+
+                    // Remove outliers (distance > median + threshold * stdDev)
+                    double cutoff = median + outlierThreshold * stdDev;
+                    var inliers = new List<PointF>();
+                    for (int i = 0; i < currentPoints.Count; i++)
+                    {
+                        var pt = currentPoints[i];
+                        double dist = Math.Abs(Math.Sqrt(Math.Pow(pt.X - a, 2) + Math.Pow(pt.Y - b, 2)) - fittedR);
+                        if (dist <= cutoff)
+                        {
+                            inliers.Add(pt);
+                        }
+                    }
+
+                    Log($"  Metrology iter {iter}: center=({a:F1},{b:F1}), r={fittedR:F1}, " +
+                        $"median={median:F2}, stdDev={stdDev:F2}, inliers={inliers.Count}/{currentPoints.Count}");
+
+                    // Check convergence
+                    if (inliers.Count == currentPoints.Count)
+                    {
+                        Log($"  Metrology: Converged at iteration {iter}");
+                        break;
+                    }
+
+                    currentPoints = inliers;
                 }
 
-                // Solve 3x3 linear system: A * [a, b, c]^T = B
-                // A = [[sumX2, sumXY, sumX], [sumXY, sumY2, sumY], [sumX, sumY, n]]
-                // B = [(sumX3 + sumXY2)/2, (sumX2Y + sumY3)/2, (sumX2 + sumY2)/2]
-                double[,] A = {
-                    { sumX2, sumXY, sumX },
-                    { sumXY, sumY2, sumY },
-                    { sumX, sumY, n }
-                };
-                double[] B = {
-                    (sumX3 + sumXY2) / 2,
-                    (sumX2Y + sumY3) / 2,
-                    (sumX2 + sumY2) / 2
-                };
-
-                // Solve using Gaussian elimination (simple 3x3)
-                double[] result = SolveLinearSystem3x3(A, B);
-                if (result == null)
-                {
-                    Log("  Metrology: Linear system solve failed");
-                    return (roughCenter, roughRadius, false);
-                }
-
-                double a = result[0], b = result[1], c = result[2];
-                double fittedR = Math.Sqrt(c + a * a + b * b);
+                // Save edge points for debug visualization
+                if (isOuterEdge)
+                    _lastOuterEdgePoints = new List<PointF>(currentPoints);
+                else
+                    _lastInnerEdgePoints = new List<PointF>(currentPoints);
 
                 PointF fittedCenter = new PointF((float)a, (float)b);
 
@@ -1623,17 +1874,61 @@ namespace CameraMaui.RingCode
                 float centerDist = (float)Math.Sqrt(Math.Pow(a - roughCenter.X, 2) + Math.Pow(b - roughCenter.Y, 2));
                 float radiusDiff = Math.Abs((float)fittedR - roughRadius);
 
-                Log($"  Metrology: fitted center=({a:F1},{b:F1}), r={fittedR:F1}, " +
-                    $"centerDist={centerDist:F1}, radiusDiff={radiusDiff:F1}, points={edgePoints.Count}");
+                Log($"  Metrology: final center=({a:F1},{b:F1}), r={fittedR:F1}, " +
+                    $"centerDist={centerDist:F1}, radiusDiff={radiusDiff:F1}, points={currentPoints.Count}");
 
-                // Accept if reasonable (center within 10% of radius, radius within 15%)
-                if (centerDist < roughRadius * 0.1f && radiusDiff < roughRadius * 0.15f)
+                // Save debug visualization
+                try
+                {
+                    var debugImg = source.Convert<Bgr, byte>();
+
+                    // Draw all original edge points as yellow (small)
+                    foreach (var pt in edgePoints)
+                    {
+                        CvInvoke.Circle(debugImg, new Point((int)pt.X, (int)pt.Y), 2, new MCvScalar(0, 255, 255), -1);
+                    }
+
+                    // Draw outliers (removed points) as red
+                    var outliers = edgePoints.Where(p => !currentPoints.Any(c =>
+                        Math.Abs(c.X - p.X) < 1 && Math.Abs(c.Y - p.Y) < 1)).ToList();
+                    foreach (var pt in outliers)
+                    {
+                        CvInvoke.Circle(debugImg, new Point((int)pt.X, (int)pt.Y), 5, new MCvScalar(0, 0, 255), -1);
+                    }
+
+                    // Draw inliers (used points) as green
+                    foreach (var pt in currentPoints)
+                    {
+                        CvInvoke.Circle(debugImg, new Point((int)pt.X, (int)pt.Y), 4, new MCvScalar(0, 255, 0), -1);
+                    }
+
+                    // Draw final fitted circle in magenta
+                    CvInvoke.Circle(debugImg, new Point((int)a, (int)b), (int)fittedR, new MCvScalar(255, 0, 255), 2);
+                    // Draw center
+                    CvInvoke.Circle(debugImg, new Point((int)a, (int)b), 5, new MCvScalar(255, 0, 255), -1);
+
+                    // Draw rough circle in cyan for comparison
+                    CvInvoke.Circle(debugImg, new Point((int)roughCenter.X, (int)roughCenter.Y),
+                        (int)roughRadius, new MCvScalar(255, 255, 0), 1);
+
+                    string suffix = isOuterEdge ? "outer" : "inner";
+                    debugImg.Save(Path.Combine(DebugOutputPath, $"07_metrology_{suffix}.png"));
+                    Log($"  Metrology debug saved: 07_metrology_{suffix}.png");
+                }
+                catch (Exception debugEx)
+                {
+                    Log($"  Metrology debug save failed: {debugEx.Message}");
+                }
+
+                // Accept if reasonable (center within 30% of radius, radius within 50%)
+                // Wide tolerance because blob radius may be much larger than actual circle
+                if (centerDist < roughRadius * 0.3f && radiusDiff < roughRadius * 0.5f)
                 {
                     return (fittedCenter, (float)fittedR, true);
                 }
                 else
                 {
-                    Log("  Metrology: Result rejected (too far from initial estimate)");
+                    Log($"  Metrology: Result rejected (centerDist={centerDist:F1}, radiusDiff={radiusDiff:F1})");
                     return (roughCenter, roughRadius, false);
                 }
             }
@@ -1642,6 +1937,52 @@ namespace CameraMaui.RingCode
                 Log($"  Metrology error: {ex.Message}");
                 return (roughCenter, roughRadius, false);
             }
+        }
+
+        /// <summary>
+        /// Least squares circle fitting for a list of points
+        /// Returns (cx, cy, r) or null if failed
+        /// </summary>
+        private (double cx, double cy, double r)? FitCircleLeastSquares(List<PointF> points)
+        {
+            if (points.Count < 3) return null;
+
+            double sumX = 0, sumY = 0, sumX2 = 0, sumY2 = 0;
+            double sumXY = 0, sumX3 = 0, sumY3 = 0, sumX2Y = 0, sumXY2 = 0;
+            int n = points.Count;
+
+            foreach (var pt in points)
+            {
+                double x = pt.X, y = pt.Y;
+                double x2 = x * x, y2 = y * y;
+                sumX += x; sumY += y;
+                sumX2 += x2; sumY2 += y2;
+                sumXY += x * y;
+                sumX3 += x2 * x; sumY3 += y2 * y;
+                sumX2Y += x2 * y; sumXY2 += x * y2;
+            }
+
+            // Solve 3x3 linear system: A * [a, b, c]^T = B
+            double[,] A = {
+                { sumX2, sumXY, sumX },
+                { sumXY, sumY2, sumY },
+                { sumX, sumY, n }
+            };
+            double[] B = {
+                (sumX3 + sumXY2) / 2,
+                (sumX2Y + sumY3) / 2,
+                (sumX2 + sumY2) / 2
+            };
+
+            double[] result = SolveLinearSystem3x3(A, B);
+            if (result == null) return null;
+
+            double a = result[0], b = result[1], c = result[2];
+            double r = Math.Sqrt(c + a * a + b * b);
+
+            if (double.IsNaN(r) || double.IsInfinity(r) || r <= 0) return null;
+
+            return (a, b, r);
         }
 
         /// <summary>
@@ -1704,3 +2045,4 @@ namespace CameraMaui.RingCode
         }
     }
 }
+#endif

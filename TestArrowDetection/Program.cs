@@ -26,8 +26,8 @@ class Program
         RingCodeDecoder.DebugOutputDir = outputDir;
 
         // Test specific image by name (set to null to test all, or filename to test one)
-        string testSpecificFile = "20260100040000604";  // Test one image
-        int maxImages = 1;
+        string testSpecificFile = null;  // Test all images
+        int maxImages = 10;
 
         var testFiles = Directory.GetFiles(testDir, "*.png");
         Console.WriteLine($"Testing {(maxImages > 0 ? maxImages : testFiles.Length)} of {testFiles.Length} images...\n");

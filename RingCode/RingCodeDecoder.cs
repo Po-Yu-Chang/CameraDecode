@@ -280,7 +280,9 @@ namespace CameraMaui.RingCode
                 // Use actual InnerRadius from segmentation instead of fixed ratio
                 float bigRadius = region.OuterRadius;
                 float innerRadius = region.InnerRadius;  // Use actual inner boundary from radial scan
-                float centerRadius = (innerRadius + bigRadius) / 2f;  // Midpoint of data ring
+
+                // CenterRadius = midpoint between inner and outer boundaries
+                float centerRadius = (innerRadius + bigRadius) / 2f;
 
                 Log($"Sampling radii: inner={innerRadius:F0}, center={centerRadius:F0}, outer={bigRadius:F0}");
 
@@ -793,6 +795,7 @@ namespace CameraMaui.RingCode
         /// Store ring type for arrow detection
         /// </summary>
         private bool _lastRingIsLight = true;
+        private PointF _lastArrowMatchCenter = PointF.Empty;  // Arrow center position for CenterRadius calculation
 
         /// <summary>
         /// Find arrow angle using BINARY template matching
@@ -808,6 +811,7 @@ namespace CameraMaui.RingCode
             _lastArrowContour2 = null;
             _lastIsYShapeArrow = false;
             _lastArrowTip = PointF.Empty;
+            _lastArrowMatchCenter = PointF.Empty;
 
             // Method 1 (PRIMARY): Template matching using user-created arrow templates
             // This is the most reliable method with proper template polarity handling
@@ -1493,6 +1497,9 @@ namespace CameraMaui.RingCode
                     Log($"  [TemplateMatch] Best match: score={bestScore:F3}, rotation={bestRotation:F1}°");
                     Log($"  [TemplateMatch] Match center: ({bestMatchCenter.X:F0},{bestMatchCenter.Y:F0}), Arrow tip: ({arrowTip.X:F0},{arrowTip.Y:F0})");
                     Log($"  [TemplateMatch] Arrow direction: atan2({dy:F0},{dx:F0}) = {finalAngle:F1}°");
+
+                    // Store arrow match center for CenterRadius calculation (HALCON method)
+                    _lastArrowMatchCenter = bestMatchCenter;
 
                     var matchResult = new ArrowMatchResult
                     {
@@ -2689,9 +2696,10 @@ namespace CameraMaui.RingCode
 
             for (int i = 0; i < SEGMENTS; i++)
             {
-                // Calculate segment angular boundaries
-                double angle1 = startRad + (i * segmentRad) - segmentRad;
-                double angle2 = startRad + ((i + 1) * segmentRad) - segmentRad;
+                // Calculate segment angular boundaries - COUNTER-CLOCKWISE from arrow
+                // In image coordinates (Y down), counter-clockwise = decreasing angle
+                double angle1 = startRad - (i * segmentRad) + segmentRad;      // startRad - (i-1)*segmentRad
+                double angle2 = startRad - ((i + 1) * segmentRad) + segmentRad; // startRad - i*segmentRad
                 double midAngleDeg = ((angle1 + angle2) / 2) * 180 / Math.PI;
 
                 // Pre-compute angles for this segment (avoid edge lines)

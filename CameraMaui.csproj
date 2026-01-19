@@ -36,6 +36,20 @@
 		<AllowUnsafeBlocks>True</AllowUnsafeBlocks>
 	</PropertyGroup>
 
+	<!-- Define platform constants for IntelliSense -->
+	<PropertyGroup Condition="$(TargetFramework.Contains('-android'))">
+		<DefineConstants>$(DefineConstants);ANDROID</DefineConstants>
+	</PropertyGroup>
+	<PropertyGroup Condition="$(TargetFramework.Contains('-windows'))">
+		<DefineConstants>$(DefineConstants);WINDOWS</DefineConstants>
+	</PropertyGroup>
+	<PropertyGroup Condition="$(TargetFramework.Contains('-ios'))">
+		<DefineConstants>$(DefineConstants);IOS</DefineConstants>
+	</PropertyGroup>
+	<PropertyGroup Condition="$(TargetFramework.Contains('-maccatalyst'))">
+		<DefineConstants>$(DefineConstants);MACCATALYST</DefineConstants>
+	</PropertyGroup>
+
 	<ItemGroup>
 		<!-- App Icon -->
 		<MauiIcon Include="Resources\AppIcon\appicon.svg" ForegroundFile="Resources\AppIcon\appiconfg.svg" Color="#512BD4" />

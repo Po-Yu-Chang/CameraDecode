@@ -34,6 +34,11 @@ namespace CameraMaui.RingCode
         // Debug output - set to a valid directory path to save arrow detection debug images
         public static string DebugOutputDir { get; set; } = null;
 
+        // Debug image counter for consistent naming (reset via ResetDebugCounter())
+        private static int _debugImageCounter = 0;
+        public static void ResetDebugCounter() => _debugImageCounter = 0;
+        private static string GetDebugId() => $"{++_debugImageCounter:D3}";
+
         // Arrow template matchers
         private ArrowTemplateMatcher _darkTemplateMatcher;
         private ArrowTemplateMatcher _lightTemplateMatcher;
@@ -795,19 +800,72 @@ namespace CameraMaui.RingCode
                 new System.Drawing.Size(3, 3), new Point(-1, -1));
             CvInvoke.Erode(binaryLocal, binaryLocal, erodeKernel, new Point(-1, -1), 1, BorderType.Default, new MCvScalar(0));
 
-            // Step 6c: SAUVOLA binarization (additional candidate)
+            // Step 6c: NON-LOCAL MEANS + OTSU binarization (best for texture/scratch noise)
+            // This approach effectively removes texture noise while preserving mark edges
+            Image<Gray, byte> binaryNlMeans = null;
+            try
+            {
+                // Fill outside ring with ring mean to avoid edge artifacts
+                var maskedForNlMeans = new Image<Gray, byte>(ringImage.Size);
+                maskedForNlMeans.SetValue(new MCvScalar(ringMean));
+                ringImage.Copy(maskedForNlMeans, ringMask);
+
+                // Apply Non-local Means denoising (h=25 for strong noise reduction)
+                var denoised = new Image<Gray, byte>(maskedForNlMeans.Size);
+                CvInvoke.FastNlMeansDenoising(maskedForNlMeans, denoised, h: 25, templateWindowSize: 7, searchWindowSize: 21);
+                maskedForNlMeans.Dispose();
+
+                // Apply Otsu threshold to denoised image
+                binaryNlMeans = new Image<Gray, byte>(denoised.Size);
+                double nlMeansOtsuThresh = CvInvoke.Threshold(denoised, binaryNlMeans, 0, 255, ThresholdType.Binary | ThresholdType.Otsu);
+                denoised.Dispose();
+
+                // For light ring (dark marks): marks become BLACK after Otsu, need to INVERT
+                // For dark ring (bright marks): marks become WHITE after Otsu, no invert needed
+                if (isLightRing)
+                {
+                    CvInvoke.BitwiseNot(binaryNlMeans, binaryNlMeans);
+                }
+
+                // Apply ring mask
+                var maskedNlMeans = new Image<Gray, byte>(binaryNlMeans.Size);
+                binaryNlMeans.Copy(maskedNlMeans, ringMask);
+                binaryNlMeans.Dispose();
+                binaryNlMeans = maskedNlMeans;
+
+                Log($"  NlMeans+Otsu: thresh={nlMeansOtsuThresh:F0}");
+            }
+            catch (Exception ex)
+            {
+                Log($"  NlMeans+Otsu failed: {ex.Message}");
+                binaryNlMeans?.Dispose();
+                binaryNlMeans = null;
+            }
+
+            // Step 6d: SAUVOLA binarization (fallback candidate)
             // Apply to original smoothed image, then mask result
             Image<Gray, byte> binarySauvola = null;
             try
             {
                 int sauvolaBlockSize = localBlockSize;
-                double sauvolaK = 0.2;  // Lower k = higher threshold = fewer detections
+
+                // Dynamic k based on local contrast (standard deviation)
+                // High contrast → higher k (more conservative, less noise)
+                // Low contrast → lower k (more aggressive detection)
+                MCvScalar convergeMean = new MCvScalar();
+                MCvScalar convergeStdDev = new MCvScalar();
+                CvInvoke.MeanStdDev(ringImage, ref convergeMean, ref convergeStdDev, ringMask);
+                double ringStdDev = convergeStdDev.V0;
+
+                // Map stdDev to k: stdDev=20→k=0.3, stdDev=50→k=0.5, stdDev=80→k=0.7
+                double sauvolaK = Math.Max(0.25, Math.Min(0.75, 0.1 + ringStdDev / 100.0));
+                Log($"  Sauvola dynamic k: stdDev={ringStdDev:F1} → k={sauvolaK:F2}");
 
                 binarySauvola = new Image<Gray, byte>(smoothed.Size);
 
-                // Apply Sauvola to unmasked image (so edge statistics are correct)
+                // Apply Sauvola to original ringImage (without CLAHE) to avoid amplified noise
                 Emgu.CV.XImgproc.XImgprocInvoke.NiBlackThreshold(
-                    smoothed,  // Use original smoothed, not masked
+                    ringImage,  // Use original image without CLAHE
                     binarySauvola,
                     255,
                     Emgu.CV.XImgproc.LocalBinarizationMethods.Sauvola,
@@ -815,9 +873,11 @@ namespace CameraMaui.RingCode
                     sauvolaK
                 );
 
-                // For light ring: Sauvola outputs white where pixel > threshold
-                // We want dark marks as white, so invert
-                if (isLightRing)
+                // Sauvola is designed for dark text on light background
+                // It outputs white where pixel < threshold (detecting dark objects)
+                // For dark ring (bright marks): need to INVERT to get bright marks as white
+                // For light ring (dark marks): no invert needed, dark marks already white
+                if (!isLightRing)
                 {
                     CvInvoke.BitwiseNot(binarySauvola, binarySauvola);
                 }
@@ -828,9 +888,57 @@ namespace CameraMaui.RingCode
                 binarySauvola.Dispose();
                 binarySauvola = maskedSauvola;
 
-                // Apply erosion
-                CvInvoke.Erode(binarySauvola, binarySauvola, erodeKernel, new Point(-1, -1), 1, BorderType.Default, new MCvScalar(0));
+                // Filter blobs by area - remove tiny noise and huge connected regions
+                // Use ring area as reference: data marks are 30-50% of ring, with ~48 marks
+                // Each mark = roughly ringArea * 0.4 / 48 = ringArea * 0.008
+                double ringAreaCalc = Math.PI * (region.OuterRadius * region.OuterRadius - region.InnerRadius * region.InnerRadius);
+                double avgMarkArea = ringAreaCalc * 0.008;  // Average expected mark area
+                double minBlobArea = 5;  // Absolute minimum: 5 pixels (remove tiny noise)
+                double maxBlobArea = ringAreaCalc * 0.05;  // Max 5% of ring area (avoid huge connected regions)
 
+                using (var contours = new VectorOfVectorOfPoint())
+                using (var hierarchy = new Mat())
+                {
+                    CvInvoke.FindContours(binarySauvola, contours, hierarchy, RetrType.External, ChainApproxMethod.ChainApproxSimple);
+
+                    // Collect blob areas for analysis
+                    var blobAreas = new List<double>();
+                    for (int i = 0; i < contours.Size; i++)
+                    {
+                        blobAreas.Add(CvInvoke.ContourArea(contours[i]));
+                    }
+
+                    // Log blob distribution for debugging
+                    if (blobAreas.Count > 0)
+                    {
+                        blobAreas.Sort();
+                        double minBlob = blobAreas[0];
+                        double maxBlob = blobAreas[^1];
+                        double medianBlob = blobAreas[blobAreas.Count / 2];
+                        int smallCount = blobAreas.Count(a => a < minBlobArea);
+                        int largeCount = blobAreas.Count(a => a > maxBlobArea);
+                        Log($"  Sauvola blobs: count={blobAreas.Count}, min={minBlob:F0}, median={medianBlob:F0}, max={maxBlob:F0}");
+                        Log($"  Sauvola filter: minArea={minBlobArea:F0}, maxArea={maxBlobArea:F0}, removing {smallCount} small + {largeCount} large");
+                    }
+
+                    // Clear the binary image and redraw only valid blobs
+                    binarySauvola.SetZero();
+                    int sauvolaKeptCount = 0;
+
+                    for (int i = 0; i < contours.Size; i++)
+                    {
+                        double area = CvInvoke.ContourArea(contours[i]);
+                        if (area >= minBlobArea && area <= maxBlobArea)
+                        {
+                            CvInvoke.DrawContours(binarySauvola, contours, i, new MCvScalar(255), -1);
+                            sauvolaKeptCount++;
+                        }
+                    }
+                    Log($"  Sauvola kept {sauvolaKeptCount} blobs after filtering");
+                }
+
+                // Apply erosion to break apart connected regions
+                CvInvoke.Erode(binarySauvola, binarySauvola, erodeKernel, new Point(-1, -1), 1, BorderType.Default, new MCvScalar(0));
                 Log($"  Sauvola: window={sauvolaBlockSize}, k={sauvolaK}");
             }
             catch (Exception ex)
@@ -876,6 +984,15 @@ namespace CameraMaui.RingCode
                 candidates.Add((binaryAdaptiveInv, "AdaptiveInv", ratioAdaptive));
                 candidates.Add((binaryLocal, "Local", ratioLocal));
 
+                // Add NlMeans+Otsu if available (best for texture/scratch noise)
+                if (binaryNlMeans != null)
+                {
+                    int whiteNlMeans = CvInvoke.CountNonZero(binaryNlMeans);
+                    double ratioNlMeans = (double)whiteNlMeans / ringArea;
+                    candidates.Add((binaryNlMeans, "NlMeans", ratioNlMeans));
+                    logMsg += $", NlMeans={ratioNlMeans:P0}";
+                }
+
                 // Add Sauvola if available
                 if (binarySauvola != null)
                 {
@@ -914,6 +1031,15 @@ namespace CameraMaui.RingCode
                 // Skip binaryAdaptive for dark rings - it incorrectly makes gray background white
                 binaryAdaptive.Dispose();
 
+                // Add NlMeans+Otsu if available (best for texture/scratch noise)
+                if (binaryNlMeans != null)
+                {
+                    int whiteNlMeans = CvInvoke.CountNonZero(binaryNlMeans);
+                    double ratioNlMeans = (double)whiteNlMeans / ringArea;
+                    candidates.Add((binaryNlMeans, "NlMeans", ratioNlMeans));
+                    logMsg += $", NlMeans={ratioNlMeans:P0}";
+                }
+
                 // Add Sauvola if available
                 if (binarySauvola != null)
                 {
@@ -929,30 +1055,33 @@ namespace CameraMaui.RingCode
                 maskedLocal.Dispose();
             }
 
-            // REVISED: Prefer Local threshold method (most similar to HALCON's dyn_threshold)
-            // Sauvola ratio is closer to target but produces worse actual results
+            // Selection priority for dark rings: NlMeans > Sauvola > Local > Otsu
+            // NlMeans+Otsu is best for texture/scratch noise removal
             binary = new Image<Gray, byte>(smoothed.Size);
             var usedMethods = new List<string>();
 
-            // Find the Local method first
+            var nlMeansCandidate = candidates.FirstOrDefault(c => c.name == "NlMeans");
+            var sauvolaCandidate = candidates.FirstOrDefault(c => c.name == "Sauvola");
             var localCandidate = candidates.FirstOrDefault(c => c.name == "Local");
 
-            if (localCandidate.img != null && localCandidate.ratio >= 0.10 && localCandidate.ratio <= 0.55)
+            // Always use NlMeans + Otsu (same as rb test) - produces cleanest output
+            if (nlMeansCandidate.img != null)
             {
-                // Use Local method - it works best for ring codes despite lower ratio
+                binary = nlMeansCandidate.img.Clone();
+                usedMethods.Add($"NlMeans({nlMeansCandidate.ratio:P0})");
+            }
+            // Fallback to Local if NlMeans not available
+            else if (localCandidate.img != null)
+            {
                 binary = localCandidate.img.Clone();
                 usedMethods.Add($"Local({localCandidate.ratio:P0})");
             }
-            else
+            // Final fallback to any available method
+            else if (candidates.Count > 0)
             {
-                // Fallback: find best single method with ratio closest to target (35%)
-                var validCandidates = candidates.Where(c => c.ratio >= 0.10 && c.ratio <= 0.55).ToList();
-                if (validCandidates.Count > 0)
-                {
-                    var best = validCandidates.OrderBy(c => Math.Abs(c.ratio - 0.35)).First();
-                    binary = best.img.Clone();
-                    usedMethods.Add($"{best.name}({best.ratio:P0})");
-                }
+                var best = candidates.First();
+                binary = best.img.Clone();
+                usedMethods.Add($"{best.name}({best.ratio:P0})");
             }
 
             // Dispose all candidate images
@@ -981,7 +1110,6 @@ namespace CameraMaui.RingCode
             var maskedBinaryTemp = binary.Copy(ringMask);
 
             // Step 9: Area filtering - remove small noise regions (like HALCON select_shape Area >= 300)
-            // Reduced from 500 to 300 to keep smaller valid marks
             int minArea = 300;
             var foreground = new Image<Gray, byte>(binary.Size);
             using var contoursFilter = new VectorOfVectorOfPoint();
@@ -1424,7 +1552,8 @@ namespace CameraMaui.RingCode
                             }
                         }
 
-                        // Find closest point of the arrow contour to circle center
+                        // Find closest point of the matched arrow blob to circle center
+                        // Pattern match already found the arrow - just need to find its apex (closest point to center)
                         if (arrowContour != null && arrowContour.Size > 0)
                         {
                             var pts = arrowContour.ToArray();
@@ -1508,14 +1637,14 @@ namespace CameraMaui.RingCode
                         }
                     }
 
-                    // Calculate green line angle from templateContour (ALWAYS, not just in debug)
+                    // Calculate green line angle from templateContour (USE TEMPLATE as ground truth)
                     Point apex = Point.Empty;
                     Point baseMid = Point.Empty;
                     if (templateContour != null)
                     {
                         var pts = templateContour.ToArray();
 
-                        // Find apex = closest to ring center
+                        // Find apex = closest to ring center (this is the arrow tip)
                         double minDist = double.MaxValue;
                         foreach (var pt in pts)
                         {
@@ -1531,17 +1660,25 @@ namespace CameraMaui.RingCode
                         double by = byDist.Take(baseCount).Average(p => p.Y);
                         baseMid = new Point((int)bx, (int)by);
 
-                        // Store template apex/baseMid for visualization (but NOT for angle calculation)
+                        // Store template apex/baseMid for visualization
                         _lastApex = apex;
                         _lastBaseMid = baseMid;
+
+                        // USE TEMPLATE APEX for angle calculation (more reliable than foreground blob)
+                        if (apex != Point.Empty)
+                        {
+                            finalAngle = Math.Atan2(apex.Y - cy, apex.X - cx) * 180.0 / Math.PI;
+                            if (finalAngle < 0) finalAngle += 360;
+                            closestPoint = apex;  // Update closestPoint to template apex
+                            Log($"  [ShapeMatcher] Template apex: ({apex.X}, {apex.Y}), angle={finalAngle:F1}°");
+                        }
                     }
 
-                    // CORRECT: Green line angle = circle center → match center (TRUE arrow direction)
-                    // This replaces the old apex→baseMid calculation
-                    _lastGreenLineAngle = finalAngle;  // Use the TRUE angle calculated above
-                    _lastCorrectedCenter = PointF.Empty;  // Not using corrected center anymore
+                    // Green line angle = circle center → template apex (TRUE arrow direction)
+                    _lastGreenLineAngle = finalAngle;
+                    _lastCorrectedCenter = PointF.Empty;
 
-                    Log($"  [ShapeMatcher] Green line angle: {finalAngle:F1}° (center→match)");
+                    Log($"  [ShapeMatcher] Green line angle: {finalAngle:F1}° (center→apex)");
 
                     // DEBUG: Save visualization with TEMPLATE contour overlay
                     if (!string.IsNullOrEmpty(DebugOutputDir))
@@ -1607,9 +1744,16 @@ namespace CameraMaui.RingCode
 
                             CvInvoke.PutText(debugImg, $"Angle={shapeResult.TemplateAngle:F0}, Scale={shapeResult.Scale:F2}, score={shapeResult.Score:F3}",
                                 new Point(10, 30), FontFace.HersheySimplex, 0.8, new MCvScalar(0, 255, 0), 2);
-                            var debugPath = Path.Combine(DebugOutputDir, $"shapematcher_debug_{DateTime.Now:HHmmss}.png");
+                            string debugId = GetDebugId();
+
+                            // Save preprocessing binary (foreground mask)
+                            var preprocPath = Path.Combine(DebugOutputDir, $"{debugId}_0_preprocess.png");
+                            foreground.Save(preprocPath);
+                            Log($"  [ShapeMatcher] Preprocess image saved: {preprocPath}");
+
+                            var debugPath = Path.Combine(DebugOutputDir, $"{debugId}_1_arrow.png");
                             debugImg.Save(debugPath);
-                            Log($"  [ShapeMatcher] Debug image saved: {debugPath}");
+                            Log($"  [ShapeMatcher] Arrow image saved: {debugPath}");
 
                             // === Save rotated image (arrow pointing to 3 o'clock / 0°) ===
                             if (_lastGreenLineAngle.HasValue)
@@ -1707,7 +1851,7 @@ namespace CameraMaui.RingCode
                                 CvInvoke.Circle(rotatedImg, new Point((int)ringCenterInCroppedX, (int)ringCenterInCroppedY), 5,
                                     new MCvScalar(0, 0, 255), -1); // Red filled circle
 
-                                var rotatedPath = Path.Combine(DebugOutputDir, $"shapematcher_rotated_{DateTime.Now:HHmmss}.png");
+                                var rotatedPath = Path.Combine(DebugOutputDir, $"{debugId}_2_rotated.png");
                                 rotatedImg.Save(rotatedPath);
                                 Log($"  [ShapeMatcher] Rotated image saved: {rotatedPath}");
                             }
@@ -2262,18 +2406,6 @@ namespace CameraMaui.RingCode
                 return (false, 0, 0, PointF.Empty);
             }
 
-            // 儲存 debug 圖片
-            if (!string.IsNullOrEmpty(DebugOutputDir))
-            {
-                try
-                {
-                    string timestamp = DateTime.Now.ToString("HHmmss_fff");
-                    _rotatedTemplates[bestTemplateIdx].Save(
-                        System.IO.Path.Combine(DebugOutputDir, $"matched_template_{timestamp}.png"));
-                }
-                catch { }
-            }
-
             return (true, angleFromCenter, bestScore, new PointF(matchCenterX, matchCenterY));
         }
 
@@ -2578,22 +2710,6 @@ namespace CameraMaui.RingCode
             CvInvoke.BitwiseNot(binaryROI, binaryROIInv);
 
             // Save preprocessing debug images
-            if (!string.IsNullOrEmpty(DebugOutputDir))
-            {
-                try
-                {
-                    string timestamp = DateTime.Now.ToString("HHmmss_fff");
-                    roiImage.Save(Path.Combine(DebugOutputDir, $"preprocess_1_gray_{timestamp}.png"));
-                    binaryROI.Save(Path.Combine(DebugOutputDir, $"preprocess_2_binary_{timestamp}.png"));
-                    binaryROIInv.Save(Path.Combine(DebugOutputDir, $"preprocess_3_binaryInv_{timestamp}.png"));
-                    Log($"  [DEBUG] Saved preprocessing images: preprocess_*_{timestamp}.png");
-                }
-                catch (Exception ex)
-                {
-                    Log($"  [DEBUG] Failed to save preprocessing images: {ex.Message}");
-                }
-            }
-
             double bestScore = 0;
             double bestAngle = 0;
             PointF bestCenter = PointF.Empty;
@@ -2611,27 +2727,6 @@ namespace CameraMaui.RingCode
             {
                 templatesToTry.Add((_lightTemplateMatcher, "Light", binaryROI));
                 templatesToTry.Add((_lightTemplateMatcher, "LightInv", binaryROIInv));
-            }
-
-            // Save template images once
-            if (!string.IsNullOrEmpty(DebugOutputDir))
-            {
-                try
-                {
-                    string timestamp = DateTime.Now.ToString("HHmmss_fff");
-                    if (_darkTemplateMatcher?.IsLoaded == true)
-                    {
-                        var darkTemplate = GetBinaryTemplate(_darkTemplateMatcher);
-                        darkTemplate?.Save(Path.Combine(DebugOutputDir, $"template_dark_{timestamp}.png"));
-                    }
-                    if (_lightTemplateMatcher?.IsLoaded == true)
-                    {
-                        var lightTemplate = GetBinaryTemplate(_lightTemplateMatcher);
-                        lightTemplate?.Save(Path.Combine(DebugOutputDir, $"template_light_{timestamp}.png"));
-                    }
-                    Log($"  [DEBUG] Saved template images");
-                }
-                catch { }
             }
 
             foreach (var (matcher, name, searchImage) in templatesToTry)
@@ -2987,23 +3082,6 @@ namespace CameraMaui.RingCode
                 // Pre-scale template once
                 using var scaledTemplate = new Image<Gray, byte>(scaledSize, scaledSize);
                 CvInvoke.Resize(activeTemplate, scaledTemplate, new System.Drawing.Size(scaledSize, scaledSize));
-
-                // Save preprocessing debug images
-                if (!string.IsNullOrEmpty(DebugOutputDir))
-                {
-                    try
-                    {
-                        string timestamp = DateTime.Now.ToString("HHmmss_fff");
-                        foreground.Save(Path.Combine(DebugOutputDir, $"preprocess_1_foreground_{timestamp}.png"));
-                        activeTemplate.Save(Path.Combine(DebugOutputDir, $"preprocess_2_template_{timestamp}.png"));
-                        scaledTemplate.Save(Path.Combine(DebugOutputDir, $"preprocess_3_scaledTemplate_{timestamp}.png"));
-                        Log($"  [DEBUG] Saved preprocessing: preprocess_*_{timestamp}.png");
-                    }
-                    catch (Exception ex)
-                    {
-                        Log($"  [DEBUG] Failed to save preprocessing: {ex.Message}");
-                    }
-                }
 
                 Log($"  [TemplateMatch] Coarse-to-fine search with Y-shape verification");
 
@@ -5804,29 +5882,6 @@ namespace CameraMaui.RingCode
                 }
 
                 // Save debug image if DebugOutputDir is set
-                if (!string.IsNullOrEmpty(DebugOutputDir))
-                {
-                    try
-                    {
-                        Directory.CreateDirectory(DebugOutputDir);
-                        string timestamp = DateTime.Now.ToString("HHmmss_fff");
-
-                        // Add rotation info text
-                        CvInvoke.PutText(output, $"Arrow: {actualArrowAngle:F1} deg", new Point(10, outputSize - 60),
-                            FontFace.HersheySimplex, 0.4, new MCvScalar(0, 255, 255), 1);
-                        CvInvoke.PutText(output, $"Rotation: {rotationNeeded:F1} deg", new Point(10, outputSize - 80),
-                            FontFace.HersheySimplex, 0.4, new MCvScalar(255, 255, 0), 1);
-
-                        string debugPath = Path.Combine(DebugOutputDir, $"rotated_debug_{timestamp}.png");
-                        output.Save(debugPath);
-                        Log($"  [DEBUG] Saved rotated image: {debugPath}");
-                    }
-                    catch (Exception ex)
-                    {
-                        Log($"  [DEBUG] Failed to save rotated debug image: {ex.Message}");
-                    }
-                }
-
                 // Cleanup temporary images
                 cropped.Dispose();
                 croppedForeground?.Dispose();

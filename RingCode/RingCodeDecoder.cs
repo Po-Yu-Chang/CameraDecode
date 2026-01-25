@@ -5021,7 +5021,7 @@ namespace CameraMaui.RingCode
                         }
                     }
 
-                    // 5. Least Squares Circle Fitting (if enough points)
+                    // 5. Least Squares Circle Fitting for OUTER circle (if enough points)
                     if (edgePoints.Count >= 20)
                     {
                         var fitResult = FitCircleLeastSquares(edgePoints.ToArray());
@@ -5030,11 +5030,6 @@ namespace CameraMaui.RingCode
                             cx = (int)fitResult.center.X;
                             cy = (int)fitResult.center.Y;
                             scaledOuterR = fitResult.radius;
-                            // Recalculate other radii keeping proportions from original
-                            float outerToInnerRatio = result.OuterRadius / result.InnerRadius;
-                            float outerToMiddleRatio = result.OuterRadius / result.MiddleRadius;
-                            scaledInnerR = scaledOuterR / outerToInnerRatio;
-                            scaledMiddleR = scaledOuterR / outerToMiddleRatio;
                             Log($"  [Rotated] LeastSquares fit (outer): center=({cx}, {cy}), outerR={scaledOuterR:F1}, points={edgePoints.Count}");
                         }
                         else
@@ -5045,6 +5040,60 @@ namespace CameraMaui.RingCode
                     else
                     {
                         Log($"  [Rotated] Not enough edge points ({edgePoints.Count}), using original center: ({cx}, {cy})");
+                    }
+
+                    // 5b. Fit INNER circle from grayscale image (dark hole boundary)
+                    using (var grayScaled = output.Convert<Gray, byte>())
+                    {
+                        using var innerEdges = new Image<Gray, byte>(outputSize, outputSize);
+                        CvInvoke.Canny(grayScaled, innerEdges, 30, 100);
+
+                        // Create ring mask around expected inner radius
+                        int expectedInnerR = (int)(scaledOuterR * result.InnerRadius / result.OuterRadius);
+                        using var innerRingMask = new Image<Gray, byte>(outputSize, outputSize);
+                        innerRingMask.SetValue(new MCvScalar(0));
+                        CvInvoke.Circle(innerRingMask, new Point(cx, cy), expectedInnerR + 20, new MCvScalar(255), -1);
+                        CvInvoke.Circle(innerRingMask, new Point(cx, cy), Math.Max(10, expectedInnerR - 20), new MCvScalar(0), -1);
+
+                        using var innerMaskedEdges = new Image<Gray, byte>(outputSize, outputSize);
+                        CvInvoke.BitwiseAnd(innerEdges, innerRingMask, innerMaskedEdges);
+
+                        var innerEdgePoints = new List<Point>();
+                        byte[,,] innerEdgeData = innerMaskedEdges.Data;
+                        for (int py = 0; py < outputSize; py++)
+                        {
+                            for (int px = 0; px < outputSize; px++)
+                            {
+                                if (innerEdgeData[py, px, 0] > 0)
+                                    innerEdgePoints.Add(new Point(px, py));
+                            }
+                        }
+
+                        if (innerEdgePoints.Count >= 20)
+                        {
+                            var innerFit = FitCircleLeastSquares(innerEdgePoints.ToArray());
+                            if (innerFit.success && innerFit.radius > 20 && innerFit.radius < scaledOuterR * 0.8f)
+                            {
+                                scaledInnerR = innerFit.radius;
+                                // Middle radius = average of inner and outer data track boundaries
+                                scaledMiddleR = (scaledInnerR + scaledOuterR) / 2;
+                                Log($"  [Rotated] LeastSquares fit (inner): innerR={scaledInnerR:F1}, middleR={scaledMiddleR:F1}, points={innerEdgePoints.Count}");
+                            }
+                            else
+                            {
+                                // Fallback to ratio calculation
+                                scaledInnerR = scaledOuterR * result.InnerRadius / result.OuterRadius;
+                                scaledMiddleR = scaledOuterR * result.MiddleRadius / result.OuterRadius;
+                                Log($"  [Rotated] Inner fit failed, using ratio: innerR={scaledInnerR:F1}");
+                            }
+                        }
+                        else
+                        {
+                            // Fallback to ratio calculation
+                            scaledInnerR = scaledOuterR * result.InnerRadius / result.OuterRadius;
+                            scaledMiddleR = scaledOuterR * result.MiddleRadius / result.OuterRadius;
+                            Log($"  [Rotated] Not enough inner edge points ({innerEdgePoints.Count}), using ratio: innerR={scaledInnerR:F1}");
+                        }
                     }
 
                     // 6. Calculate Y-arrow angle from NEW center
@@ -5117,12 +5166,13 @@ namespace CameraMaui.RingCode
                 }
 
                 // Draw X marks on filled segments (bit=1)
+                // Use same angle direction as grid lines (clockwise from arrow position)
                 if (!string.IsNullOrEmpty(result.BinaryString) && result.BinaryString.Length == 48)
                 {
                     for (int i = 0; i < SEGMENTS; i++)
                     {
-                        // In rotated image, arrow is at 0° + gridOffset, segments go counter-clockwise
-                        double midAngle = (-i * SEGMENT_ANGLE + SEGMENT_ANGLE / 2) * Math.PI / 180 + gridOffsetRad;
+                        // Same direction as segment numbers: clockwise from gridOffset
+                        double midAngle = (i * SEGMENT_ANGLE - SEGMENT_ANGLE / 2) * Math.PI / 180 + gridOffsetRad;
                         bool hasInnerBit = result.BinaryString[i * 2] == '1';
                         bool hasOuterBit = result.BinaryString[i * 2 + 1] == '1';
 

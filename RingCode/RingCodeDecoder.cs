@@ -303,8 +303,11 @@ namespace CameraMaui.RingCode
         // Private field to track last match type
         private string _lastMatchType = "";
 
-        // Green line angle (apex → baseMid) for accurate rotation
+        // Green line geometry for accurate center calculation
         private double? _lastGreenLineAngle = null;
+        private Point _lastApex = Point.Empty;
+        private Point _lastBaseMid = Point.Empty;
+        private PointF _lastCorrectedCenter = PointF.Empty;  // Center calculated from green line geometry
 
         // Circle ratios based on HALCON code analysis
         // BigCircle = outer edge, CenterCircle = middle ring, InnerCircle = inner edge
@@ -437,13 +440,23 @@ namespace CameraMaui.RingCode
                 bool bestHasBothValid = false;  // Both parity and BCC valid
                 bool found = false;
 
+                // Use original center (segmentation result is more reliable than green line estimate)
+                // Green line geometry is good for angle, but center from circle fitting is more accurate
+                PointF decodeCenter = region.Center;
+                if (_lastCorrectedCenter != PointF.Empty && _lastMatchType == "ShapeMatcher")
+                {
+                    // Log for debugging, but DON'T use corrected center for decode
+                    // Segmentation center is based on actual ring boundaries, which is more reliable
+                    Log($"  [DEBUG] Corrected center: ({_lastCorrectedCenter.X:F1}, {_lastCorrectedCenter.Y:F1}), using original: ({region.Center.X:F1}, {region.Center.Y:F1})");
+                }
+
                 // If ShapeMatcher found the arrow, use its angle DIRECTLY (no offset search)
                 // ShapeMatcher uses contour base point which is precise
                 if (_lastMatchType == "ShapeMatcher")
                 {
-                    // Direct decode using ShapeMatcher angle - no offset search
+                    // Direct decode using ShapeMatcher angle AND corrected center
                     bestBinary = DecodeWithRegionIntersection(
-                        foregroundMask, region.Center, innerRadius, centerRadius, bigRadius, baseAngle);
+                        foregroundMask, decodeCenter, innerRadius, centerRadius, bigRadius, baseAngle);
                     var (decoded, parityValid, bccValid) = DecryptBinaryWithValidation(bestBinary);
                     bestDecoded = decoded;
                     bestAngle = baseAngle;
@@ -465,7 +478,7 @@ namespace CameraMaui.RingCode
                     {
                         double testAngle = baseAngle + offset;
                         string binary = DecodeWithRegionIntersection(
-                            foregroundMask, region.Center, innerRadius, centerRadius, bigRadius, testAngle);
+                            foregroundMask, decodeCenter, innerRadius, centerRadius, bigRadius, testAngle);
                         var (decoded, parityValid, bccValid) = DecryptBinaryWithValidation(binary);
 
                         if (decoded != "-1" && decoded != "0")
@@ -500,6 +513,19 @@ namespace CameraMaui.RingCode
                 result.IsValid = found;
 
                 Log($"Ring#{region.Index}: Arrow={t3 - t2}ms, Decode={t4 - t3}ms, Total={t4}ms, Valid={found}, Data={bestDecoded}");
+
+                // If decode failed, try rotated decode using green line angle
+                if (!found && result.GreenLineAngle.HasValue && foregroundMask != null)
+                {
+                    var rotatedResult = TryRotatedDecode(foregroundMask, grayImage, region, result);
+                    if (rotatedResult.success)
+                    {
+                        result.BinaryString = rotatedResult.binary;
+                        result.DecodedData = rotatedResult.decoded;
+                        result.IsValid = true;
+                        Log($"Ring#{region.Index}: Rotated decode SUCCESS: {rotatedResult.decoded}");
+                    }
+                }
 
                 return result;
             }
@@ -719,8 +745,7 @@ namespace CameraMaui.RingCode
             CvInvoke.AdaptiveThreshold(smoothed, binaryAdaptive, 255,
                 AdaptiveThresholdType.GaussianC, ThresholdType.Binary, blockSize, C);
 
-            // Step 6b: LOCAL_THRESHOLD approach (similar to HALCON)
-            // HALCON: mean_image + dyn_threshold
+            // Step 6b: LOCAL_THRESHOLD approach (similar to HALCON dyn_threshold)
             // Compute local mean using box filter, then threshold based on difference
             int localBlockSize = Math.Max(41, (int)(region.OuterRadius / 3) | 1);
             localBlockSize = Math.Min(localBlockSize, 151);
@@ -741,8 +766,7 @@ namespace CameraMaui.RingCode
             // Dynamic threshold: compare pixel to local mean
             // For light rings: pixel < localMean - offset means dark mark (foreground)
             // For dark rings: pixel > localMean + offset means bright mark (foreground)
-            // Higher offset = better separation between regions
-            double localOffset = 18;  // Increased for better region separation
+            double localOffset = 20;  // Fixed offset approach
             var binaryLocal = new Image<Gray, byte>(smoothed.Size);
 
             // Compute difference: localMean - smoothed (for finding dark regions)
@@ -764,12 +788,12 @@ namespace CameraMaui.RingCode
                 CvInvoke.Threshold(diffBright, binaryLocal, localOffset, 255, ThresholdType.Binary);
             }
 
-            // Apply erosion to break apart connected regions in Local threshold result
+            localMean.Dispose();
+
+            // Apply erosion to break apart connected regions
             using var erodeKernel = CvInvoke.GetStructuringElement(ElementShape.Ellipse,
                 new System.Drawing.Size(3, 3), new Point(-1, -1));
             CvInvoke.Erode(binaryLocal, binaryLocal, erodeKernel, new Point(-1, -1), 1, BorderType.Default, new MCvScalar(0));
-
-            localMean.Dispose();
 
             // Step 7: Choose best binary result from Otsu, Adaptive, and Local methods
             Image<Gray, byte> binary;
@@ -838,21 +862,35 @@ namespace CameraMaui.RingCode
                 maskedLocal.Dispose();
             }
 
-            // IMPROVED: Combine multiple methods (UNION) instead of picking just one
-            // This captures marks detected by ANY method, reducing missed detections
+            // REVISED: Prefer Local threshold method (most similar to HALCON's dyn_threshold)
+            // Only fall back to other methods if Local fails
             binary = new Image<Gray, byte>(smoothed.Size);
             var usedMethods = new List<string>();
 
+            // Find the Local method first
+            var localCandidate = candidates.FirstOrDefault(c => c.name == "Local");
+
+            if (localCandidate.img != null && localCandidate.ratio >= 0.10 && localCandidate.ratio <= 0.55)
+            {
+                // Use Local method only if it has reasonable ratio
+                binary = localCandidate.img.Clone();
+                usedMethods.Add($"Local({localCandidate.ratio:P0})");
+            }
+            else
+            {
+                // Fallback: find best single method with ratio closest to target (40%)
+                var validCandidates = candidates.Where(c => c.ratio >= 0.10 && c.ratio <= 0.55).ToList();
+                if (validCandidates.Count > 0)
+                {
+                    var best = validCandidates.OrderBy(c => Math.Abs(c.ratio - 0.35)).First();
+                    binary = best.img.Clone();
+                    usedMethods.Add($"{best.name}({best.ratio:P0})");
+                }
+            }
+
+            // Dispose all candidate images
             foreach (var c in candidates)
             {
-                // Include methods with ratio between 5% and 60%
-                // Too low = noise, too high = merged marks
-                if (c.ratio >= 0.05 && c.ratio <= 0.60)
-                {
-                    // OR operation - union of all valid methods
-                    CvInvoke.BitwiseOr(binary, c.img, binary);
-                    usedMethods.Add($"{c.name}({c.ratio:P0})");
-                }
                 c.img.Dispose();
             }
 
@@ -1255,6 +1293,10 @@ namespace CameraMaui.RingCode
             _lastIsYShapeArrow = false;
             _lastArrowTip = PointF.Empty;
             _lastArrowMatchCenter = PointF.Empty;
+            _lastGreenLineAngle = null;
+            _lastApex = Point.Empty;
+            _lastBaseMid = Point.Empty;
+            _lastCorrectedCenter = PointF.Empty;
 
 #if WINDOWS
             // Method -1 (PRIMARY): Shape-Based Matching using real Y-arrow template
@@ -1281,7 +1323,68 @@ namespace CameraMaui.RingCode
 
                     float cx = region.Center.X;
                     float cy = region.Center.Y;
-                    double finalAngle = shapeResult.Angle;
+
+                    // Find the blob in foreground that contains the match center
+                    // Then find the closest point of that blob to the circle center
+                    double trueArrowAngle = Math.Atan2(shapeResult.Center.Y - cy, shapeResult.Center.X - cx) * 180.0 / Math.PI;
+                    Point closestPoint = Point.Empty;
+
+                    // Find contours in foreground mask
+                    using (var contours = new VectorOfVectorOfPoint())
+                    using (var hierarchy = new Mat())
+                    {
+                        CvInvoke.FindContours(foreground, contours, hierarchy, RetrType.External, ChainApproxMethod.ChainApproxSimple);
+
+                        // Find the contour that contains the match center
+                        Point matchPt = new Point((int)shapeResult.Center.X, (int)shapeResult.Center.Y);
+                        VectorOfPoint arrowContour = null;
+                        double minDistToMatch = double.MaxValue;
+
+                        for (int i = 0; i < contours.Size; i++)
+                        {
+                            var contour = contours[i];
+                            // Check if match center is inside or near this contour
+                            double dist = CvInvoke.PointPolygonTest(contour, new PointF(matchPt.X, matchPt.Y), true);
+                            if (dist >= 0) // Inside contour
+                            {
+                                arrowContour = contour;
+                                break;
+                            }
+                            else if (Math.Abs(dist) < minDistToMatch)
+                            {
+                                minDistToMatch = Math.Abs(dist);
+                                arrowContour = contour;
+                            }
+                        }
+
+                        // Find closest point of the arrow contour to circle center
+                        if (arrowContour != null && arrowContour.Size > 0)
+                        {
+                            var pts = arrowContour.ToArray();
+                            double minDist = double.MaxValue;
+
+                            foreach (var pt in pts)
+                            {
+                                double d = Math.Sqrt(Math.Pow(pt.X - cx, 2) + Math.Pow(pt.Y - cy, 2));
+                                if (d < minDist)
+                                {
+                                    minDist = d;
+                                    closestPoint = pt;
+                                }
+                            }
+
+                            if (closestPoint != Point.Empty)
+                            {
+                                trueArrowAngle = Math.Atan2(closestPoint.Y - cy, closestPoint.X - cx) * 180.0 / Math.PI;
+                                Log($"  [ShapeMatcher] Arrow blob closest point: ({closestPoint.X}, {closestPoint.Y}), dist={minDist:F1}");
+                            }
+                        }
+                    }
+
+                    if (trueArrowAngle < 0) trueArrowAngle += 360;
+                    double finalAngle = trueArrowAngle;
+
+                    Log($"  [ShapeMatcher] TRUE angle from center({cx:F0},{cy:F0}): {trueArrowAngle:F1}°");
 
                     // Load template image and get its contour
                     VectorOfPoint templateContour = null;
@@ -1361,12 +1464,17 @@ namespace CameraMaui.RingCode
                         double by = byDist.Take(baseCount).Average(p => p.Y);
                         baseMid = new Point((int)bx, (int)by);
 
-                        // Calculate and store green line angle (apex → baseMid)
-                        double greenLineAngle = Math.Atan2(baseMid.Y - apex.Y, baseMid.X - apex.X) * 180.0 / Math.PI;
-                        if (greenLineAngle < 0) greenLineAngle += 360;
-                        _lastGreenLineAngle = greenLineAngle;
-                        Log($"  [ShapeMatcher] Green line angle: {greenLineAngle:F1}° (apex→baseMid)");
+                        // Store template apex/baseMid for visualization (but NOT for angle calculation)
+                        _lastApex = apex;
+                        _lastBaseMid = baseMid;
                     }
+
+                    // CORRECT: Green line angle = circle center → match center (TRUE arrow direction)
+                    // This replaces the old apex→baseMid calculation
+                    _lastGreenLineAngle = finalAngle;  // Use the TRUE angle calculated above
+                    _lastCorrectedCenter = PointF.Empty;  // Not using corrected center anymore
+
+                    Log($"  [ShapeMatcher] Green line angle: {finalAngle:F1}° (center→match)");
 
                     // DEBUG: Save visualization with TEMPLATE contour overlay
                     if (!string.IsNullOrEmpty(DebugOutputDir))
@@ -1384,14 +1492,43 @@ namespace CameraMaui.RingCode
                                 CvInvoke.AddWeighted(debugImg, 0.6, overlay, 0.4, 0, debugImg);
                                 CvInvoke.DrawContours(debugImg, contourArray, 0, new MCvScalar(0, 255, 255), 2); // Yellow outline
 
-                                // Draw GREEN axis line: apex → base midpoint (using pre-calculated values)
+                                // Draw template apex/baseMid for reference (small dots)
                                 if (apex != Point.Empty && baseMid != Point.Empty)
                                 {
-                                    CvInvoke.Line(debugImg, apex, baseMid, new MCvScalar(0, 255, 0), 3);
-                                    // Draw apex (cyan) and base midpoint (green) dots
-                                    CvInvoke.Circle(debugImg, apex, 8, new MCvScalar(255, 255, 0), -1);
-                                    CvInvoke.Circle(debugImg, baseMid, 6, new MCvScalar(0, 255, 0), -1);
+                                    CvInvoke.Circle(debugImg, apex, 5, new MCvScalar(255, 255, 0), -1);  // Cyan - apex
+                                    CvInvoke.Circle(debugImg, baseMid, 4, new MCvScalar(0, 255, 0), -1);  // Green - baseMid
                                 }
+                            }
+
+                            // Draw GREEN axis line: CIRCLE CENTER → CLOSEST POINT → extended outward
+                            // This is the TRUE arrow direction based on blob's closest point to center!
+                            {
+                                // Use closestPoint if found, otherwise fall back to match center
+                                float targetX = closestPoint != Point.Empty ? closestPoint.X : shapeResult.Center.X;
+                                float targetY = closestPoint != Point.Empty ? closestPoint.Y : shapeResult.Center.Y;
+
+                                float dx = targetX - cx;
+                                float dy = targetY - cy;
+                                float len = (float)Math.Sqrt(dx * dx + dy * dy);
+                                if (len > 0)
+                                {
+                                    float dirX = dx / len;
+                                    float dirY = dy / len;
+
+                                    // Line from circle center, through closest point, to outer edge
+                                    Point lineStart = new Point((int)cx, (int)cy);
+                                    Point lineEnd = new Point(
+                                        (int)(cx + dirX * region.OuterRadius * 1.15f),
+                                        (int)(cy + dirY * region.OuterRadius * 1.15f));
+
+                                    CvInvoke.Line(debugImg, lineStart, lineEnd, new MCvScalar(0, 255, 0), 3);
+                                }
+                            }
+
+                            // Draw closest point - CYAN dot (this is the apex of the arrow blob)
+                            if (closestPoint != Point.Empty)
+                            {
+                                CvInvoke.Circle(debugImg, closestPoint, 8, new MCvScalar(255, 255, 0), -1);
                             }
 
                             // Draw match center - MAGENTA dot
@@ -1412,25 +1549,96 @@ namespace CameraMaui.RingCode
                             {
                                 double rotationAngle = _lastGreenLineAngle.Value;
 
-                                // Create rotation matrix centered on ring center
-                                var ringCenter = new PointF((float)cx, (float)cy);
+                                // First, crop the image to center the ring
+                                int margin = (int)(region.OuterRadius * 1.2f);
+                                int cropX = Math.Max(0, (int)cx - margin);
+                                int cropY = Math.Max(0, (int)cy - margin);
+                                int cropW = Math.Min(debugImg.Width - cropX, margin * 2);
+                                int cropH = Math.Min(debugImg.Height - cropY, margin * 2);
+
+                                // Ensure square crop
+                                int cropSize = Math.Min(cropW, cropH);
+                                var cropRect = new Rectangle(cropX, cropY, cropSize, cropSize);
+
+                                // Crop using ROI
+                                debugImg.ROI = cropRect;
+                                var croppedImg = debugImg.Copy();
+                                debugImg.ROI = Rectangle.Empty;  // Reset ROI
+
+                                // Ring center position in cropped image
+                                float ringCenterInCroppedX = (float)cx - cropX;
+                                float ringCenterInCroppedY = (float)cy - cropY;
+
+                                // Create rotation matrix centered on ring center IN CROPPED IMAGE
+                                // When image rotates by θ, a line at angle α becomes at angle α-θ in the new coordinate system
+                                // To bring green line from 82° to 0°: need 82° - θ = 0°, so θ = 82° (positive)
                                 using var rotMat = new Mat();
-                                CvInvoke.GetRotationMatrix2D(ringCenter, rotationAngle, 1.0, rotMat);
+                                CvInvoke.GetRotationMatrix2D(new PointF(ringCenterInCroppedX, ringCenterInCroppedY), rotationAngle, 1.0, rotMat);
 
                                 // Apply rotation
-                                using var rotatedImg = new Mat();
-                                CvInvoke.WarpAffine(debugImg, rotatedImg, rotMat, debugImg.Size,
+                                using var rotatedImg = new Image<Bgr, byte>(croppedImg.Size);
+                                CvInvoke.WarpAffine(croppedImg, rotatedImg, rotMat, croppedImg.Size,
                                     Inter.Linear, Warp.Default, BorderType.Constant, new MCvScalar(0, 0, 0));
+
+                                // Calculate center from GREEN LINE geometry (apex → baseMid)
+                                // The center lies on the line extending from baseMid through apex
+                                float newCenterX = ringCenterInCroppedX;
+                                float newCenterY = ringCenterInCroppedY;
+                                float newOuterR = region.OuterRadius;
+
+                                if (apex != Point.Empty && baseMid != Point.Empty)
+                                {
+                                    // Direction from baseMid to apex (points toward center)
+                                    float dx = apex.X - baseMid.X;
+                                    float dy = apex.Y - baseMid.Y;
+                                    float distApexToBase = (float)Math.Sqrt(dx * dx + dy * dy);
+
+                                    if (distApexToBase > 10) // Sanity check
+                                    {
+                                        // Normalize direction
+                                        float dirX = dx / distApexToBase;
+                                        float dirY = dy / distApexToBase;
+
+                                        // BaseMid is at ~0.80-0.85R from center
+                                        // Use slightly higher factor to compensate for systematic Y bias
+                                        float baseMidToCenter = region.OuterRadius * 0.82f;
+                                        float estCenterX = baseMid.X + dirX * baseMidToCenter;
+                                        float estCenterY = baseMid.Y + dirY * baseMidToCenter;
+
+                                        // Transform to cropped image coordinates
+                                        newCenterX = estCenterX - cropX;
+                                        newCenterY = estCenterY - cropY;
+
+                                        Log($"  [ShapeMatcher] GreenLine center: ({newCenterX:F1}, {newCenterY:F1}) from apex({apex.X},{apex.Y})→baseMid({baseMid.X},{baseMid.Y})");
+                                        Log($"  [ShapeMatcher] Center shift: dx={newCenterX - ringCenterInCroppedX:F1}, dy={newCenterY - ringCenterInCroppedY:F1}");
+                                    }
+                                    else
+                                    {
+                                        Log($"  [ShapeMatcher] Apex-BaseMid distance too small ({distApexToBase:F1}), using original center");
+                                    }
+                                }
+                                else
+                                {
+                                    Log($"  [ShapeMatcher] No apex/baseMid available, using original center");
+                                }
 
                                 // Add text showing original angle and rotation
                                 CvInvoke.PutText(rotatedImg, $"Rotated to 3 o'clock (green line was at {rotationAngle:F1} deg)",
-                                    new Point(10, 60), FontFace.HersheySimplex, 0.7, new MCvScalar(0, 255, 255), 2);
+                                    new Point(10, 30), FontFace.HersheySimplex, 0.6, new MCvScalar(0, 255, 255), 2);
 
-                                // Draw reference line at 0° (3 o'clock direction)
-                                int refLength = (int)(region.OuterRadius * 0.8);
-                                Point refEnd = new Point((int)(cx + refLength), (int)cy);
-                                CvInvoke.Line(rotatedImg, new Point((int)cx, (int)cy), refEnd,
-                                    new MCvScalar(0, 255, 255), 2); // Yellow reference line
+                                // Draw reference line at 0° from NEW center (cyan)
+                                int refLength = (int)(newOuterR * 0.8);
+                                Point refEnd = new Point((int)(newCenterX + refLength), (int)newCenterY);
+                                CvInvoke.Line(rotatedImg, new Point((int)newCenterX, (int)newCenterY), refEnd,
+                                    new MCvScalar(255, 255, 0), 2); // Cyan reference line from new center
+
+                                // Draw new center (green circle)
+                                CvInvoke.Circle(rotatedImg, new Point((int)newCenterX, (int)newCenterY), 5,
+                                    new MCvScalar(0, 255, 0), -1); // Green filled circle
+
+                                // Draw old center for comparison (red circle)
+                                CvInvoke.Circle(rotatedImg, new Point((int)ringCenterInCroppedX, (int)ringCenterInCroppedY), 5,
+                                    new MCvScalar(0, 0, 255), -1); // Red filled circle
 
                                 var rotatedPath = Path.Combine(DebugOutputDir, $"shapematcher_rotated_{DateTime.Now:HHmmss}.png");
                                 rotatedImg.Save(rotatedPath);
@@ -4594,6 +4802,221 @@ namespace CameraMaui.RingCode
         }
 
         /// <summary>
+        /// Try to decode using rotated image with LeastSquares-fitted center
+        /// </summary>
+        private (bool success, string binary, string decoded) TryRotatedDecode(
+            Image<Gray, byte> foregroundMask, Image<Gray, byte> grayImage,
+            RingImageSegmentation.RingRegion region, RingCodeResult result)
+        {
+            try
+            {
+                double greenLineAngle = result.GreenLineAngle.Value;
+                int cx = (int)region.Center.X;
+                int cy = (int)region.Center.Y;
+                int margin = (int)(region.OuterRadius * 1.3);
+
+                // Crop and rotate foreground
+                int x = Math.Max(0, cx - margin);
+                int y = Math.Max(0, cy - margin);
+                int w = Math.Min(foregroundMask.Width - x, margin * 2);
+                int h = Math.Min(foregroundMask.Height - y, margin * 2);
+
+                var cropRect = new Rectangle(x, y, w, h);
+                using var cropped = new Image<Gray, byte>(w, h);
+                foregroundMask.ROI = cropRect;
+                foregroundMask.CopyTo(cropped);
+                foregroundMask.ROI = Rectangle.Empty;
+
+                // Rotate to put green line at 0°
+                float ringCenterInCroppedX = cx - x;
+                float ringCenterInCroppedY = cy - y;
+                using var rotationMatrix = new Mat();
+                CvInvoke.GetRotationMatrix2D(
+                    new PointF(ringCenterInCroppedX, ringCenterInCroppedY),
+                    greenLineAngle, 1.0, rotationMatrix);
+
+                using var rotated = new Image<Gray, byte>(w, h);
+                CvInvoke.WarpAffine(cropped, rotated, rotationMatrix, new System.Drawing.Size(w, h));
+
+                // Resize to standard size
+                int outputSize = 400;
+                using var scaled = new Image<Gray, byte>(outputSize, outputSize);
+                CvInvoke.Resize(rotated, scaled, new System.Drawing.Size(outputSize, outputSize));
+
+                float scale = outputSize / (float)(margin * 2);
+                int newCx = (int)(ringCenterInCroppedX * scale);
+                int newCy = (int)(ringCenterInCroppedY * scale);
+                float scaledOuterR = region.OuterRadius * scale;
+                float scaledInnerR = region.InnerRadius * scale;
+
+                // Fit outer circle from foreground edges
+                using var edges = new Image<Gray, byte>(outputSize, outputSize);
+                CvInvoke.Canny(scaled, edges, 50, 150);
+
+                using var ringMask = new Image<Gray, byte>(outputSize, outputSize);
+                ringMask.SetValue(new MCvScalar(0));
+                CvInvoke.Circle(ringMask, new Point(newCx, newCy), (int)scaledOuterR + 15, new MCvScalar(255), -1);
+                CvInvoke.Circle(ringMask, new Point(newCx, newCy), (int)scaledOuterR - 15, new MCvScalar(0), -1);
+
+                using var maskedEdges = new Image<Gray, byte>(outputSize, outputSize);
+                CvInvoke.BitwiseAnd(edges, ringMask, maskedEdges);
+
+                var edgePoints = new List<Point>();
+                byte[,,] edgeData = maskedEdges.Data;
+                for (int py = 0; py < outputSize; py++)
+                    for (int px = 0; px < outputSize; px++)
+                        if (edgeData[py, px, 0] > 0)
+                            edgePoints.Add(new Point(px, py));
+
+                if (edgePoints.Count >= 20)
+                {
+                    var fit = FitCircleLeastSquares(edgePoints.ToArray());
+                    if (fit.success && fit.radius > 50)
+                    {
+                        newCx = (int)fit.center.X;
+                        newCy = (int)fit.center.Y;
+                        scaledOuterR = fit.radius;
+                        Log($"  [RotatedDecode] LeastSquares fit (outer): center=({newCx}, {newCy}), outerR={scaledOuterR:F1}, points={edgePoints.Count}");
+                    }
+                }
+
+                // Also fit inner circle from edges (like visualization code does)
+                using var innerRingMask = new Image<Gray, byte>(outputSize, outputSize);
+                innerRingMask.SetValue(new MCvScalar(0));
+                float expectedInnerR = scaledOuterR * region.InnerRadius / region.OuterRadius;
+                CvInvoke.Circle(innerRingMask, new Point(newCx, newCy), (int)expectedInnerR + 15, new MCvScalar(255), -1);
+                CvInvoke.Circle(innerRingMask, new Point(newCx, newCy), Math.Max(0, (int)expectedInnerR - 15), new MCvScalar(0), -1);
+
+                using var innerMaskedEdges = new Image<Gray, byte>(outputSize, outputSize);
+                CvInvoke.BitwiseAnd(edges, innerRingMask, innerMaskedEdges);
+
+                var innerEdgePoints = new List<Point>();
+                byte[,,] innerEdgeData = innerMaskedEdges.Data;
+                for (int py = 0; py < outputSize; py++)
+                    for (int px = 0; px < outputSize; px++)
+                        if (innerEdgeData[py, px, 0] > 0)
+                            innerEdgePoints.Add(new Point(px, py));
+
+                if (innerEdgePoints.Count >= 20)
+                {
+                    var innerFit = FitCircleLeastSquares(innerEdgePoints.ToArray());
+                    if (innerFit.success && innerFit.radius > 20)
+                    {
+                        scaledInnerR = innerFit.radius;
+                        Log($"  [RotatedDecode] LeastSquares fit (inner): innerR={scaledInnerR:F1}, points={innerEdgePoints.Count}");
+                    }
+                    else
+                    {
+                        scaledInnerR = expectedInnerR;
+                    }
+                }
+                else
+                {
+                    scaledInnerR = expectedInnerR;
+                }
+
+                // Calculate arrow angle from new center (apex is at 0° from original center after rotation)
+                float origCxScaled = ringCenterInCroppedX * scale;
+                float origCyScaled = ringCenterInCroppedY * scale;
+                float apexX = origCxScaled + scaledInnerR;
+                float apexY = origCyScaled;
+                double gridOffsetRad = Math.Atan2(apexY - newCy, apexX - newCx);
+
+                // Try different middle radius adjustments and directions to find valid decode
+                float baseMiddleRatio = result.MiddleRadius / region.OuterRadius;
+                float[] adjustments = { 1.08f, 1.05f, 1.10f, 1.02f, 1.12f, 1.0f };
+                int[] directions = { -1, 1 };  // -1 = counter-clockwise, 1 = clockwise
+                byte[,,] fgData = scaled.Data;
+                const int ANGULAR_SAMPLES = 8;
+                const int RADIAL_SAMPLES = 6;
+                double segmentRad = SEGMENT_ANGLE * Math.PI / 180;
+
+                foreach (var direction in directions)
+                {
+                    foreach (var adj in adjustments)
+                    {
+                        float adjustedRatio = baseMiddleRatio * adj;
+                        float scaledMiddleR = scaledOuterR * adjustedRatio;
+
+                        // Sample segments (direction determines clockwise/counter-clockwise)
+                        var binaryBuilder = new System.Text.StringBuilder(48);
+
+                        for (int i = 0; i < SEGMENTS; i++)
+                        {
+                            double angle1 = gridOffsetRad + direction * (i * segmentRad) - direction * segmentRad;
+                            double angle2 = gridOffsetRad + direction * ((i + 1) * segmentRad) - direction * segmentRad;
+                            double angleStep = (angle2 - angle1) / (ANGULAR_SAMPLES + 1);
+
+                            // Sample inner track
+                            int innerWhite = 0, innerTotal = 0;
+                            float innerRStep = (scaledMiddleR - scaledInnerR) / RADIAL_SAMPLES;
+                            for (int r = 0; r < RADIAL_SAMPLES; r++)
+                            {
+                                float radius = scaledInnerR + innerRStep * (r + 0.5f);
+                                for (int a = 1; a <= ANGULAR_SAMPLES; a++)
+                                {
+                                    double angle = angle1 + a * angleStep;
+                                    int px = (int)(newCx + radius * Math.Cos(angle));
+                                    int py = (int)(newCy + radius * Math.Sin(angle));
+                                    if (px >= 0 && px < outputSize && py >= 0 && py < outputSize)
+                                    {
+                                        innerTotal++;
+                                        if (fgData[py, px, 0] > 128) innerWhite++;
+                                    }
+                                }
+                            }
+                            int innerBit = (innerTotal > 0 && (double)innerWhite / innerTotal >= FILL_THRESHOLD) ? 1 : 0;
+
+                            // Sample outer track
+                            int outerWhite = 0, outerTotal = 0;
+                            float outerRStep = (scaledOuterR - scaledMiddleR) / RADIAL_SAMPLES;
+                            for (int r = 0; r < RADIAL_SAMPLES; r++)
+                            {
+                                float radius = scaledMiddleR + outerRStep * (r + 0.5f);
+                                for (int a = 1; a <= ANGULAR_SAMPLES; a++)
+                                {
+                                    double angle = angle1 + a * angleStep;
+                                    int px = (int)(newCx + radius * Math.Cos(angle));
+                                    int py = (int)(newCy + radius * Math.Sin(angle));
+                                    if (px >= 0 && px < outputSize && py >= 0 && py < outputSize)
+                                    {
+                                        outerTotal++;
+                                        if (fgData[py, px, 0] > 128) outerWhite++;
+                                    }
+                                }
+                            }
+                            int outerBit = (outerTotal > 0 && (double)outerWhite / outerTotal >= FILL_THRESHOLD) ? 1 : 0;
+
+                            binaryBuilder.Append(innerBit);
+                            binaryBuilder.Append(outerBit);
+                        }
+
+                        string binary = binaryBuilder.ToString();
+                        var (decoded, parityValid, bccValid) = DecryptBinaryWithValidation(binary);
+
+                        if (decoded != "-1")
+                        {
+                            string dirName = direction < 0 ? "CCW" : "CW";
+                            Log($"  [RotatedDecode] SUCCESS {dirName} adj={adj:F2}: middleR={scaledMiddleR:F1}");
+                            Log($"  [RotatedDecode] Binary: {binary}");
+                            Log($"  [RotatedDecode] Result: {decoded}, parity={parityValid}, BCC={bccValid}");
+                            return (true, binary, decoded);
+                        }
+                    }
+                }
+
+                // Log failure for debugging
+                Log($"  [RotatedDecode] All directions/adjustments failed. Base ratio={baseMiddleRatio:F3}");
+            }
+            catch (Exception ex)
+            {
+                Log($"  [RotatedDecode] Error: {ex.Message}");
+            }
+
+            return (false, "", "-1");
+        }
+
+        /// <summary>
         /// Draw a small cross mark
         /// </summary>
         private void DrawCross(Image<Bgr, byte> img, int x, int y, int size, MCvScalar color)
@@ -5075,15 +5498,12 @@ namespace CameraMaui.RingCode
                             if (innerFit.success && innerFit.radius > 20 && innerFit.radius < scaledOuterR * 0.8f)
                             {
                                 scaledInnerR = innerFit.radius;
-                                // Middle radius = average of inner and outer data track boundaries
-                                scaledMiddleR = (scaledInnerR + scaledOuterR) / 2;
-                                Log($"  [Rotated] LeastSquares fit (inner): innerR={scaledInnerR:F1}, middleR={scaledMiddleR:F1}, points={innerEdgePoints.Count}");
+                                Log($"  [Rotated] LeastSquares fit (inner): innerR={scaledInnerR:F1}, points={innerEdgePoints.Count}");
                             }
                             else
                             {
                                 // Fallback to ratio calculation
                                 scaledInnerR = scaledOuterR * result.InnerRadius / result.OuterRadius;
-                                scaledMiddleR = scaledOuterR * result.MiddleRadius / result.OuterRadius;
                                 Log($"  [Rotated] Inner fit failed, using ratio: innerR={scaledInnerR:F1}");
                             }
                         }
@@ -5091,10 +5511,16 @@ namespace CameraMaui.RingCode
                         {
                             // Fallback to ratio calculation
                             scaledInnerR = scaledOuterR * result.InnerRadius / result.OuterRadius;
-                            scaledMiddleR = scaledOuterR * result.MiddleRadius / result.OuterRadius;
                             Log($"  [Rotated] Not enough inner edge points ({innerEdgePoints.Count}), using ratio: innerR={scaledInnerR:F1}");
                         }
                     }
+
+                    // 5c. Calculate MIDDLE radius using fixed ratio from fitted outer radius
+                    // Adjust ratio to position middle circle in the gap between inner/outer tracks
+                    float middleRatio = result.MiddleRadius / result.OuterRadius;
+                    float adjustedRatio = middleRatio * 1.08f;  // Increase by 8% to move outward
+                    scaledMiddleR = scaledOuterR * adjustedRatio;
+                    Log($"  [Rotated] Middle radius: middleR={scaledMiddleR:F1} (original ratio={middleRatio:F3}, adjusted={adjustedRatio:F3})");
 
                     // 6. Calculate Y-arrow angle from NEW center
                     // After rotation, the apex is at 0° direction from the ORIGINAL center
@@ -5165,29 +5591,115 @@ namespace CameraMaui.RingCode
                         FontFace.HersheySimplex, 0.3, lineColor, 1);
                 }
 
-                // Draw X marks on filled segments (bit=1)
-                // Use same angle direction as grid lines (clockwise from arrow position)
-                if (!string.IsNullOrEmpty(result.BinaryString) && result.BinaryString.Length == 48)
+                // RE-DECODE using rotated foreground with corrected center and radii
+                // This should match the X marks visualization
+                string rotatedBinaryString = "";
+                if (scaledFgForArrow != null)
                 {
+                    byte[,,] fgData = scaledFgForArrow.Data;
+                    int fgWidth = scaledFgForArrow.Width;
+                    int fgHeight = scaledFgForArrow.Height;
+
+                    var binaryBuilder = new System.Text.StringBuilder(48);
+                    const int ANGULAR_SAMPLES = 8;
+                    const int RADIAL_SAMPLES = 6;
+
+                    for (int i = 0; i < SEGMENTS; i++)
+                    {
+                        // COUNTER-CLOCKWISE from gridOffset (same as original decoder)
+                        double segmentRad = SEGMENT_ANGLE * Math.PI / 180;
+                        double angle1 = gridOffsetRad - (i * segmentRad) + segmentRad;
+                        double angle2 = gridOffsetRad - ((i + 1) * segmentRad) + segmentRad;
+                        double angleStep = (angle2 - angle1) / (ANGULAR_SAMPLES + 1);
+
+                        // Sample inner track
+                        int innerWhite = 0, innerTotal = 0;
+                        float innerRStep = (scaledMiddleR - scaledInnerR) / RADIAL_SAMPLES;
+                        for (int r = 0; r < RADIAL_SAMPLES; r++)
+                        {
+                            float radius = scaledInnerR + innerRStep * (r + 0.5f);
+                            for (int a = 1; a <= ANGULAR_SAMPLES; a++)
+                            {
+                                double angle = angle1 + a * angleStep;
+                                int px = (int)(cx + radius * Math.Cos(angle));
+                                int py = (int)(cy + radius * Math.Sin(angle));
+                                if (px >= 0 && px < fgWidth && py >= 0 && py < fgHeight)
+                                {
+                                    innerTotal++;
+                                    if (fgData[py, px, 0] > 128) innerWhite++;
+                                }
+                            }
+                        }
+                        int innerBit = (innerTotal > 0 && (double)innerWhite / innerTotal >= FILL_THRESHOLD) ? 1 : 0;
+
+                        // Sample outer track
+                        int outerWhite = 0, outerTotal = 0;
+                        float outerRStep = (scaledOuterR - scaledMiddleR) / RADIAL_SAMPLES;
+                        for (int r = 0; r < RADIAL_SAMPLES; r++)
+                        {
+                            float radius = scaledMiddleR + outerRStep * (r + 0.5f);
+                            for (int a = 1; a <= ANGULAR_SAMPLES; a++)
+                            {
+                                double angle = angle1 + a * angleStep;
+                                int px = (int)(cx + radius * Math.Cos(angle));
+                                int py = (int)(cy + radius * Math.Sin(angle));
+                                if (px >= 0 && px < fgWidth && py >= 0 && py < fgHeight)
+                                {
+                                    outerTotal++;
+                                    if (fgData[py, px, 0] > 128) outerWhite++;
+                                }
+                            }
+                        }
+                        int outerBit = (outerTotal > 0 && (double)outerWhite / outerTotal >= FILL_THRESHOLD) ? 1 : 0;
+
+                        binaryBuilder.Append(innerBit);
+                        binaryBuilder.Append(outerBit);
+                    }
+
+                    rotatedBinaryString = binaryBuilder.ToString();
+                    Log($"  [Rotated] Binary: {rotatedBinaryString}");
+
+                    // Try to decode the rotated binary string
+                    var (rotatedDecoded, parityValid, bccValid) = DecryptBinaryWithValidation(rotatedBinaryString);
+                    Log($"  [Rotated] Re-decoded: {rotatedDecoded}, parity={parityValid}, BCC={bccValid}");
+
+                    // Update result if rotated decode is better
+                    if (rotatedDecoded != "-1" && !result.IsValid)
+                    {
+                        result.BinaryString = rotatedBinaryString;
+                        result.DecodedData = rotatedDecoded;
+                        result.IsValid = true;
+                        Log($"  [Rotated] Updated result with rotated decode!");
+                    }
+                }
+
+                // Draw X marks based on rotated binary string (or check foreground directly)
+                if (scaledFgForArrow != null)
+                {
+                    byte[,,] fgData = scaledFgForArrow.Data;
+                    int fgWidth = scaledFgForArrow.Width;
+                    int fgHeight = scaledFgForArrow.Height;
+
                     for (int i = 0; i < SEGMENTS; i++)
                     {
                         // Same direction as segment numbers: clockwise from gridOffset
                         double midAngle = (i * SEGMENT_ANGLE - SEGMENT_ANGLE / 2) * Math.PI / 180 + gridOffsetRad;
-                        bool hasInnerBit = result.BinaryString[i * 2] == '1';
-                        bool hasOuterBit = result.BinaryString[i * 2 + 1] == '1';
 
-                        if (hasInnerBit)
+                        // Check inner track
+                        float innerR = (scaledInnerR + scaledMiddleR) / 2;
+                        int xi = (int)(cx + innerR * Math.Cos(midAngle));
+                        int yi = (int)(cy + innerR * Math.Sin(midAngle));
+                        if (xi >= 0 && xi < fgWidth && yi >= 0 && yi < fgHeight && fgData[yi, xi, 0] > 128)
                         {
-                            float r = (scaledInnerR + scaledMiddleR) / 2;
-                            int xi = (int)(cx + r * Math.Cos(midAngle));
-                            int yi = (int)(cy + r * Math.Sin(midAngle));
                             DrawCross(output, xi, yi, 4, lineColor);
                         }
-                        if (hasOuterBit)
+
+                        // Check outer track
+                        float outerR = (scaledMiddleR + scaledOuterR) / 2;
+                        int xo = (int)(cx + outerR * Math.Cos(midAngle));
+                        int yo = (int)(cy + outerR * Math.Sin(midAngle));
+                        if (xo >= 0 && xo < fgWidth && yo >= 0 && yo < fgHeight && fgData[yo, xo, 0] > 128)
                         {
-                            float r = (scaledMiddleR + scaledOuterR) / 2;
-                            int xo = (int)(cx + r * Math.Cos(midAngle));
-                            int yo = (int)(cy + r * Math.Sin(midAngle));
                             DrawCross(output, xo, yo, 4, lineColor);
                         }
                     }

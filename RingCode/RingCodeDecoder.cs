@@ -801,7 +801,7 @@ namespace CameraMaui.RingCode
             try
             {
                 int sauvolaBlockSize = localBlockSize;
-                double sauvolaK = 0.5;  // Higher k for industrial images with high contrast
+                double sauvolaK = 0.2;  // Lower k = higher threshold = fewer detections
 
                 binarySauvola = new Image<Gray, byte>(smoothed.Size);
 
@@ -930,7 +930,7 @@ namespace CameraMaui.RingCode
             }
 
             // REVISED: Prefer Local threshold method (most similar to HALCON's dyn_threshold)
-            // Only fall back to other methods if Local fails
+            // Sauvola ratio is closer to target but produces worse actual results
             binary = new Image<Gray, byte>(smoothed.Size);
             var usedMethods = new List<string>();
 
@@ -939,13 +939,13 @@ namespace CameraMaui.RingCode
 
             if (localCandidate.img != null && localCandidate.ratio >= 0.10 && localCandidate.ratio <= 0.55)
             {
-                // Use Local method only if it has reasonable ratio
+                // Use Local method - it works best for ring codes despite lower ratio
                 binary = localCandidate.img.Clone();
                 usedMethods.Add($"Local({localCandidate.ratio:P0})");
             }
             else
             {
-                // Fallback: find best single method with ratio closest to target (40%)
+                // Fallback: find best single method with ratio closest to target (35%)
                 var validCandidates = candidates.Where(c => c.ratio >= 0.10 && c.ratio <= 0.55).ToList();
                 if (validCandidates.Count > 0)
                 {

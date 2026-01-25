@@ -795,7 +795,52 @@ namespace CameraMaui.RingCode
                 new System.Drawing.Size(3, 3), new Point(-1, -1));
             CvInvoke.Erode(binaryLocal, binaryLocal, erodeKernel, new Point(-1, -1), 1, BorderType.Default, new MCvScalar(0));
 
-            // Step 7: Choose best binary result from Otsu, Adaptive, and Local methods
+            // Step 6c: SAUVOLA binarization (additional candidate)
+            // Apply to original smoothed image, then mask result
+            Image<Gray, byte> binarySauvola = null;
+            try
+            {
+                int sauvolaBlockSize = localBlockSize;
+                double sauvolaK = 0.5;  // Higher k for industrial images with high contrast
+
+                binarySauvola = new Image<Gray, byte>(smoothed.Size);
+
+                // Apply Sauvola to unmasked image (so edge statistics are correct)
+                Emgu.CV.XImgproc.XImgprocInvoke.NiBlackThreshold(
+                    smoothed,  // Use original smoothed, not masked
+                    binarySauvola,
+                    255,
+                    Emgu.CV.XImgproc.LocalBinarizationMethods.Sauvola,
+                    sauvolaBlockSize,
+                    sauvolaK
+                );
+
+                // For light ring: Sauvola outputs white where pixel > threshold
+                // We want dark marks as white, so invert
+                if (isLightRing)
+                {
+                    CvInvoke.BitwiseNot(binarySauvola, binarySauvola);
+                }
+
+                // Apply ring mask to remove areas outside the ring
+                var maskedSauvola = new Image<Gray, byte>(smoothed.Size);
+                binarySauvola.Copy(maskedSauvola, ringMask);
+                binarySauvola.Dispose();
+                binarySauvola = maskedSauvola;
+
+                // Apply erosion
+                CvInvoke.Erode(binarySauvola, binarySauvola, erodeKernel, new Point(-1, -1), 1, BorderType.Default, new MCvScalar(0));
+
+                Log($"  Sauvola: window={sauvolaBlockSize}, k={sauvolaK}");
+            }
+            catch (Exception ex)
+            {
+                Log($"  Sauvola failed: {ex.Message}");
+                binarySauvola?.Dispose();
+                binarySauvola = null;
+            }
+
+            // Step 7: Choose best binary result from Otsu, Adaptive, Local, and Sauvola methods
             Image<Gray, byte> binary;
             string binaryMethod;
 
@@ -825,11 +870,22 @@ namespace CameraMaui.RingCode
                 double ratioAdaptive = (double)whiteAdaptive / ringArea;
                 double ratioLocal = (double)whiteLocal / ringArea;
 
-                Log($"    Light ring binary: Otsu={ratioOtsu:P0}, Adaptive={ratioAdaptive:P0}, Local={ratioLocal:P0}");
+                string logMsg = $"    Light ring binary: Otsu={ratioOtsu:P0}, Adaptive={ratioAdaptive:P0}, Local={ratioLocal:P0}";
 
                 candidates.Add((binaryOtsuInv, "OtsuInv", ratioOtsu));
                 candidates.Add((binaryAdaptiveInv, "AdaptiveInv", ratioAdaptive));
                 candidates.Add((binaryLocal, "Local", ratioLocal));
+
+                // Add Sauvola if available
+                if (binarySauvola != null)
+                {
+                    int whiteSauvola = CvInvoke.CountNonZero(binarySauvola);
+                    double ratioSauvola = (double)whiteSauvola / ringArea;
+                    candidates.Add((binarySauvola, "Sauvola", ratioSauvola));
+                    logMsg += $", Sauvola={ratioSauvola:P0}";
+                }
+
+                Log(logMsg);
 
                 maskedOtsu.Dispose();
                 maskedAdaptive.Dispose();
@@ -851,12 +907,23 @@ namespace CameraMaui.RingCode
                 double ratioOtsu = (double)whiteOtsu / ringArea;
                 double ratioLocal = (double)whiteLocal / ringArea;
 
-                Log($"    Dark ring binary: Otsu={ratioOtsu:P0}, Local={ratioLocal:P0} (Adaptive skipped)");
+                string logMsg = $"    Dark ring binary: Otsu={ratioOtsu:P0}, Local={ratioLocal:P0}";
 
                 candidates.Add((binaryOtsu, "Otsu", ratioOtsu));
                 candidates.Add((binaryLocal, "Local", ratioLocal));
                 // Skip binaryAdaptive for dark rings - it incorrectly makes gray background white
                 binaryAdaptive.Dispose();
+
+                // Add Sauvola if available
+                if (binarySauvola != null)
+                {
+                    int whiteSauvola = CvInvoke.CountNonZero(binarySauvola);
+                    double ratioSauvola = (double)whiteSauvola / ringArea;
+                    candidates.Add((binarySauvola, "Sauvola", ratioSauvola));
+                    logMsg += $", Sauvola={ratioSauvola:P0}";
+                }
+
+                Log(logMsg);
 
                 maskedOtsu.Dispose();
                 maskedLocal.Dispose();

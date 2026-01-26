@@ -1664,13 +1664,23 @@ namespace CameraMaui.RingCode
                         _lastApex = apex;
                         _lastBaseMid = baseMid;
 
-                        // USE TEMPLATE APEX for angle calculation (more reliable than foreground blob)
-                        if (apex != Point.Empty)
+                        // USE midpoint of apex+baseMid for angle (Y junction center = best reference)
+                        if (apex != Point.Empty && baseMid != Point.Empty)
+                        {
+                            // Midpoint of apex (branch junction) and baseMid (stem tip) = Y center
+                            double midX = (apex.X + baseMid.X) / 2.0;
+                            double midY = (apex.Y + baseMid.Y) / 2.0;
+                            finalAngle = Math.Atan2(midY - cy, midX - cx) * 180.0 / Math.PI;
+                            if (finalAngle < 0) finalAngle += 360;
+                            closestPoint = new Point((int)midX, (int)midY);
+                            Log($"  [ShapeMatcher] apex: ({apex.X},{apex.Y}), baseMid: ({baseMid.X},{baseMid.Y}), mid=({midX:F0},{midY:F0}), angle={finalAngle:F1}° (center→mid)");
+                        }
+                        else if (apex != Point.Empty)
                         {
                             finalAngle = Math.Atan2(apex.Y - cy, apex.X - cx) * 180.0 / Math.PI;
                             if (finalAngle < 0) finalAngle += 360;
-                            closestPoint = apex;  // Update closestPoint to template apex
-                            Log($"  [ShapeMatcher] Template apex: ({apex.X}, {apex.Y}), angle={finalAngle:F1}°");
+                            closestPoint = apex;
+                            Log($"  [ShapeMatcher] Template apex only: ({apex.X}, {apex.Y}), angle={finalAngle:F1}°");
                         }
                     }
 
@@ -1678,7 +1688,7 @@ namespace CameraMaui.RingCode
                     _lastGreenLineAngle = finalAngle;
                     _lastCorrectedCenter = PointF.Empty;
 
-                    Log($"  [ShapeMatcher] Green line angle: {finalAngle:F1}° (center→apex)");
+                    Log($"  [ShapeMatcher] Green line angle: {finalAngle:F1}° (center→mid)");
 
                     // DEBUG: Save visualization with TEMPLATE contour overlay
                     if (!string.IsNullOrEmpty(DebugOutputDir))
@@ -1704,10 +1714,9 @@ namespace CameraMaui.RingCode
                                 }
                             }
 
-                            // Draw GREEN axis line: CIRCLE CENTER → CLOSEST POINT → extended outward
-                            // This is the TRUE arrow direction based on blob's closest point to center!
+                            // Draw GREEN axis line: CIRCLE CENTER → arrow midpoint → extended outward
                             {
-                                // Use closestPoint if found, otherwise fall back to match center
+                                // Use closestPoint (set to midpoint of apex+baseMid) for green line
                                 float targetX = closestPoint != Point.Empty ? closestPoint.X : shapeResult.Center.X;
                                 float targetY = closestPoint != Point.Empty ? closestPoint.Y : shapeResult.Center.Y;
 

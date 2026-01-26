@@ -960,28 +960,14 @@ namespace CameraMaui.Pages
 
             int width = convertedBitmap.Width;
             int height = convertedBitmap.Height;
-            var image = new Image<Bgr, byte>(width, height);
 
-            // Use unsafe pointer access for much faster conversion
+            // FAST: Use Mat with direct memory copy + CvtColor (instead of slow per-pixel Data[] access)
             IntPtr pixelsPtr = convertedBitmap.GetPixels();
-            int rowBytes = convertedBitmap.RowBytes;
+            using var bgraMat = new Mat(height, width, Emgu.CV.CvEnum.DepthType.Cv8U, 4, pixelsPtr, convertedBitmap.RowBytes);
+            using var bgrMat = new Mat();
+            CvInvoke.CvtColor(bgraMat, bgrMat, Emgu.CV.CvEnum.ColorConversion.Bgra2Bgr);
 
-            unsafe
-            {
-                byte* srcPtr = (byte*)pixelsPtr.ToPointer();
-
-                for (int y = 0; y < height; y++)
-                {
-                    byte* rowPtr = srcPtr + y * rowBytes;
-                    for (int x = 0; x < width; x++)
-                    {
-                        int offset = x * 4; // BGRA format
-                        image.Data[y, x, 0] = rowPtr[offset];     // B
-                        image.Data[y, x, 1] = rowPtr[offset + 1]; // G
-                        image.Data[y, x, 2] = rowPtr[offset + 2]; // R
-                    }
-                }
-            }
+            var image = bgrMat.ToImage<Bgr, byte>();
 
             // Dispose converted bitmap if we created a new one
             if (convertedBitmap != skBitmap)
@@ -1004,24 +990,33 @@ namespace CameraMaui.Pages
             var info = new SKImageInfo(width, height, SKColorType.Bgra8888, SKAlphaType.Premul);
             var skBitmap = new SKBitmap(info);
 
-            // Use unsafe pointer access for much faster conversion
+            // FAST: Use Mat with CvtColor + direct memory copy (instead of slow per-pixel Data[] access)
+            using var bgrMat = image.Mat;
+            using var bgraMat = new Mat();
+            CvInvoke.CvtColor(bgrMat, bgraMat, Emgu.CV.CvEnum.ColorConversion.Bgr2Bgra);
+
+            // Copy Mat data directly to SKBitmap pixel buffer
             IntPtr pixelsPtr = skBitmap.GetPixels();
-            int rowBytes = skBitmap.RowBytes;
+            int skRowBytes = skBitmap.RowBytes;
+            int matStep = bgraMat.Step;
+            int rowWidth = width * 4;
 
             unsafe
             {
+                byte* srcPtr = (byte*)bgraMat.DataPointer.ToPointer();
                 byte* dstPtr = (byte*)pixelsPtr.ToPointer();
 
-                for (int y = 0; y < height; y++)
+                // If strides match, copy entire buffer at once (fastest)
+                if (skRowBytes == matStep && matStep == rowWidth)
                 {
-                    byte* rowPtr = dstPtr + y * rowBytes;
-                    for (int x = 0; x < width; x++)
+                    Buffer.MemoryCopy(srcPtr, dstPtr, height * rowWidth, height * rowWidth);
+                }
+                else
+                {
+                    // Copy row-by-row if stride differs
+                    for (int y = 0; y < height; y++)
                     {
-                        int offset = x * 4; // BGRA format
-                        rowPtr[offset] = image.Data[y, x, 0];     // B
-                        rowPtr[offset + 1] = image.Data[y, x, 1]; // G
-                        rowPtr[offset + 2] = image.Data[y, x, 2]; // R
-                        rowPtr[offset + 3] = 255;                  // A
+                        Buffer.MemoryCopy(srcPtr + y * matStep, dstPtr + y * skRowBytes, rowWidth, rowWidth);
                     }
                 }
             }

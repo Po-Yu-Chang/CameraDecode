@@ -99,4 +99,24 @@
 	  <PackageReference Include="Emgu.CV.runtime.windows" Version="4.9.0.5494" />
 	</ItemGroup>
 
+	<!-- Exclude ShapeMatcher project from MAUI build (it will be referenced separately) -->
+	<ItemGroup>
+		<Compile Remove="CameraMaui.ShapeMatcher\**" />
+		<None Remove="CameraMaui.ShapeMatcher\**" />
+	</ItemGroup>
+
+	<!-- Reference ShapeMatcher library (Windows only for now) -->
+	<ItemGroup Condition="$(TargetFramework.Contains('-windows'))">
+		<ProjectReference Include="CameraMaui.ShapeMatcher\CameraMaui.ShapeMatcher.csproj" />
+	</ItemGroup>
+
+	<!-- Include native ShapeBasedMatcher DLL for Windows -->
+	<ItemGroup Condition="$(TargetFramework.Contains('-windows'))">
+		<ContentWithTargetPath Include="NativeLibs\ShapeBasedMatcher\build\Release\ShapeBasedMatcher.dll"
+		                       Condition="Exists('NativeLibs\ShapeBasedMatcher\build\Release\ShapeBasedMatcher.dll')">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+			<TargetPath>ShapeBasedMatcher.dll</TargetPath>
+		</ContentWithTargetPath>
+	</ItemGroup>
+
 </Project>

@@ -519,17 +519,16 @@ namespace CameraMaui.RingCode
 
                 Log($"Ring#{region.Index}: Arrow={t3 - t2}ms, Decode={t4 - t3}ms, Total={t4}ms, Valid={found}, Data={bestDecoded}");
 
-                // If decode failed OR BCC validation failed, try rotated decode using green line angle
-                // Rotated decode uses LeastSquares re-fit for better circle alignment
-                if ((!found || !bestHasBothValid) && result.GreenLineAngle.HasValue && foregroundMask != null)
+                // Always try rotated decode - uses LeastSquares re-fit for better circle alignment
+                if (result.GreenLineAngle.HasValue && foregroundMask != null)
                 {
                     var rotatedResult = TryRotatedDecode(foregroundMask, grayImage, region, result);
                     if (rotatedResult.success)
                     {
+                        Log($"Ring#{region.Index}: Rotated decode {(found ? "OVERRIDE" : "FALLBACK")}: {rotatedResult.decoded} (direct was: {bestDecoded})");
                         result.BinaryString = rotatedResult.binary;
                         result.DecodedData = rotatedResult.decoded;
                         result.IsValid = true;
-                        Log($"Ring#{region.Index}: Rotated decode {(found ? "OVERRIDE" : "SUCCESS")}: {rotatedResult.decoded}");
                     }
                 }
 
@@ -4993,10 +4992,22 @@ namespace CameraMaui.RingCode
                 using var rotated = new Image<Gray, byte>(w, h);
                 CvInvoke.WarpAffine(cropped, rotated, rotationMatrix, new System.Drawing.Size(w, h));
 
+                // Also crop and rotate grayImage for better edge detection (circle fitting)
+                using var croppedGray = new Image<Gray, byte>(w, h);
+                grayImage.ROI = cropRect;
+                grayImage.CopyTo(croppedGray);
+                grayImage.ROI = Rectangle.Empty;
+
+                using var rotatedGray = new Image<Gray, byte>(w, h);
+                CvInvoke.WarpAffine(croppedGray, rotatedGray, rotationMatrix, new System.Drawing.Size(w, h));
+
                 // Resize to standard size
-                int outputSize = 400;
+                int outputSize = 500;
                 using var scaled = new Image<Gray, byte>(outputSize, outputSize);
                 CvInvoke.Resize(rotated, scaled, new System.Drawing.Size(outputSize, outputSize));
+
+                using var scaledGray = new Image<Gray, byte>(outputSize, outputSize);
+                CvInvoke.Resize(rotatedGray, scaledGray, new System.Drawing.Size(outputSize, outputSize));
 
                 float scale = outputSize / (float)(margin * 2);
                 int newCx = (int)(ringCenterInCroppedX * scale);
@@ -5004,9 +5015,9 @@ namespace CameraMaui.RingCode
                 float scaledOuterR = region.OuterRadius * scale;
                 float scaledInnerR = region.InnerRadius * scale;
 
-                // Fit outer circle from foreground edges
+                // Fit outer circle from GRAYSCALE edges (not binary foreground)
                 using var edges = new Image<Gray, byte>(outputSize, outputSize);
-                CvInvoke.Canny(scaled, edges, 50, 150);
+                CvInvoke.Canny(scaledGray, edges, 50, 150);
 
                 using var ringMask = new Image<Gray, byte>(outputSize, outputSize);
                 ringMask.SetValue(new MCvScalar(0));

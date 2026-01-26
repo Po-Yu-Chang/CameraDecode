@@ -519,8 +519,9 @@ namespace CameraMaui.RingCode
 
                 Log($"Ring#{region.Index}: Arrow={t3 - t2}ms, Decode={t4 - t3}ms, Total={t4}ms, Valid={found}, Data={bestDecoded}");
 
-                // If decode failed, try rotated decode using green line angle
-                if (!found && result.GreenLineAngle.HasValue && foregroundMask != null)
+                // If decode failed OR BCC validation failed, try rotated decode using green line angle
+                // Rotated decode uses LeastSquares re-fit for better circle alignment
+                if ((!found || !bestHasBothValid) && result.GreenLineAngle.HasValue && foregroundMask != null)
                 {
                     var rotatedResult = TryRotatedDecode(foregroundMask, grayImage, region, result);
                     if (rotatedResult.success)
@@ -528,7 +529,7 @@ namespace CameraMaui.RingCode
                         result.BinaryString = rotatedResult.binary;
                         result.DecodedData = rotatedResult.decoded;
                         result.IsValid = true;
-                        Log($"Ring#{region.Index}: Rotated decode SUCCESS: {rotatedResult.decoded}");
+                        Log($"Ring#{region.Index}: Rotated decode {(found ? "OVERRIDE" : "SUCCESS")}: {rotatedResult.decoded}");
                     }
                 }
 

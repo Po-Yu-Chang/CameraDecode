@@ -9,8 +9,8 @@
     Directory.Build.props 會在 SDK 匯入前被載入，適合放這類設定。
   -->
   <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('windows'))">
-    <BaseIntermediateOutputPath>$(TEMP)\CameraMaui\obj\</BaseIntermediateOutputPath>
-    <MSBuildProjectExtensionsPath>$(TEMP)\CameraMaui\obj\</MSBuildProjectExtensionsPath>
-    <BaseOutputPath>$(TEMP)\CameraMaui\bin\</BaseOutputPath>
+    <BaseIntermediateOutputPath>$(TEMP)\CameraMaui\$(MSBuildProjectName)\obj\</BaseIntermediateOutputPath>
+    <MSBuildProjectExtensionsPath>$(TEMP)\CameraMaui\$(MSBuildProjectName)\obj\</MSBuildProjectExtensionsPath>
+    <BaseOutputPath>$(TEMP)\CameraMaui\$(MSBuildProjectName)\bin\</BaseOutputPath>
   </PropertyGroup>
 </Project>

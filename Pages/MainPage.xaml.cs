@@ -58,11 +58,10 @@ namespace CameraMaui.Pages
             _ringCodeDecoder.InitializeTemplates();
             Log($"Templates loaded - Dark: {_ringCodeDecoder.HasDarkTemplate}, Light: {_ringCodeDecoder.HasLightTemplate}");
 
-            // Enable debug output for arrow detection - saves to Desktop
-            RingCodeDecoder.DebugOutputDir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
-                "ArrowDebug");
-            Log($"Arrow debug output enabled: {RingCodeDecoder.DebugOutputDir}");
+            // Debug output disabled for production (saves 3-4 PNGs per ring, very slow)
+            // To enable: RingCodeDecoder.DebugOutputDir = Path.Combine(
+            //     Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "ArrowDebug");
+            RingCodeDecoder.DebugOutputDir = null;
 
             // Test orientation service
             var orientation = _deviceOrientationService?.GetOrentation() ?? DeviceOrientation.Undefined;
@@ -116,7 +115,9 @@ namespace CameraMaui.Pages
                 }
 
                 _currentImage = await ConvertImageSourceToSKBitmap(imageSource);
-                _currentEmguImage = ConvertSKBitmapToEmguImage(_currentImage);
+                // Emgu conversion deferred to OnAnalyzeClicked (lazy)
+                _currentEmguImage?.Dispose();
+                _currentEmguImage = null;
 
                 await SetSourceImage(_currentImage);
                 lblStatus.Text = "Status: Image captured - Ready to analyze";
@@ -170,7 +171,9 @@ namespace CameraMaui.Pages
                             throw new Exception("Failed to decode image");
                         }
 
-                        _currentEmguImage = ConvertSKBitmapToEmguImage(_currentImage);
+                        // Emgu conversion deferred to OnAnalyzeClicked (lazy)
+                        _currentEmguImage?.Dispose();
+                        _currentEmguImage = null;
                     });
 
                     await SetSourceImageFast(_currentImage);
@@ -191,7 +194,7 @@ namespace CameraMaui.Pages
 
         /// <summary>
         /// Load image directly from file path (handles special characters like [R])
-        /// Optimized: Uses SKCodec subsampling for ultra-fast loading of large images
+        /// Optimized: Defers Emgu conversion to analysis time
         /// </summary>
         private async Task LoadImageFromPath(string filePath)
         {
@@ -215,7 +218,7 @@ namespace CameraMaui.Pages
                     byte[] imageBytes = await File.ReadAllBytesAsync(filePath);
                     Log($"Read {imageBytes.Length / 1024} KB in {sw.ElapsedMilliseconds}ms");
 
-                    // Decode full image first
+                    // Decode full image
                     using var memoryStream = new MemoryStream(imageBytes);
                     var fullBitmap = SKBitmap.Decode(memoryStream);
                     if (fullBitmap == null)
@@ -245,33 +248,18 @@ namespace CameraMaui.Pages
 
                     Log($"Analysis size: {_currentImage.Width}x{_currentImage.Height} in {sw.ElapsedMilliseconds}ms");
 
-                    // Convert to Emgu for analysis
-                    _currentEmguImage = ConvertSKBitmapToEmguImage(_currentImage);
-                    Log($"Emgu conversion done in {sw.ElapsedMilliseconds}ms");
+                    // Emgu conversion deferred to OnAnalyzeClicked (lazy)
+                    _currentEmguImage?.Dispose();
+                    _currentEmguImage = null;
 
-                    // Create display thumbnail
-                    const int displaySize = 1200;
-                    SKBitmap displayBitmap = _currentImage;
-                    if (_currentImage.Width > displaySize || _currentImage.Height > displaySize)
-                    {
-                        float scale = Math.Min((float)displaySize / _currentImage.Width,
-                                               (float)displaySize / _currentImage.Height);
-                        var resizeInfo = new SKImageInfo(
-                            (int)(_currentImage.Width * scale),
-                            (int)(_currentImage.Height * scale),
-                            SKColorType.Bgra8888, SKAlphaType.Premul);
-                        displayBitmap = _currentImage.Resize(resizeInfo, SKFilterQuality.Medium);
-                    }
-
-                    // Save display image
+                    // Save for display (use analysis bitmap directly, MAUI handles scaling via AspectFit)
                     using var fs = File.OpenWrite(tempPath);
-                    displayBitmap.Encode(fs, SKEncodedImageFormat.Jpeg, 85);
-                    if (displayBitmap != _currentImage) displayBitmap.Dispose();
+                    _currentImage.Encode(fs, SKEncodedImageFormat.Jpeg, 85);
 
-                    Log($"Total: {sw.ElapsedMilliseconds}ms");
+                    Log($"Total load: {sw.ElapsedMilliseconds}ms");
                 });
 
-                // Update UI
+                // Update UI (single call)
                 await MainThread.InvokeOnMainThreadAsync(() =>
                 {
                     sourceImage.Source = ImageSource.FromFile(tempPath);
@@ -391,91 +379,50 @@ namespace CameraMaui.Pages
 
             try
             {
-                await MainThread.InvokeOnMainThreadAsync(() =>
+                lblStatus.Text = "Status: Loading image...";
+
+                string tempPath = Path.Combine(FileSystem.CacheDirectory, $"source_{DateTime.Now.Ticks}.jpg");
+                bool needsResize = bitmap.Width > 1200 || bitmap.Height > 1200;
+
+                // Heavy work on background thread
+                await Task.Run(() =>
                 {
-                    lblStatus.Text = "Status: Loading image...";
-                });
+                    const int maxDisplaySize = 1200;
+                    SKBitmap displayBitmap = bitmap;
 
-                // For display: resize large images to max 1200px for faster loading
-                const int maxDisplaySize = 1200;
-                SKBitmap displayBitmap = bitmap;
-                bool needsResize = bitmap.Width > maxDisplaySize || bitmap.Height > maxDisplaySize;
-
-                if (needsResize)
-                {
-                    float scale = Math.Min((float)maxDisplaySize / bitmap.Width, (float)maxDisplaySize / bitmap.Height);
-                    int newWidth = (int)(bitmap.Width * scale);
-                    int newHeight = (int)(bitmap.Height * scale);
-                    Log($"Resizing for display: {bitmap.Width}x{bitmap.Height} -> {newWidth}x{newHeight}");
-
-                    displayBitmap = new SKBitmap(newWidth, newHeight, SKColorType.Bgra8888, SKAlphaType.Premul);
-                    using (var canvas = new SKCanvas(displayBitmap))
+                    if (needsResize)
                     {
-                        canvas.DrawBitmap(bitmap, new SKRect(0, 0, newWidth, newHeight));
+                        float scale = Math.Min((float)maxDisplaySize / bitmap.Width, (float)maxDisplaySize / bitmap.Height);
+                        int newWidth = (int)(bitmap.Width * scale);
+                        int newHeight = (int)(bitmap.Height * scale);
+                        Log($"Resizing for display: {bitmap.Width}x{bitmap.Height} -> {newWidth}x{newHeight}");
+
+                        var resizeInfo = new SKImageInfo(newWidth, newHeight, SKColorType.Bgra8888, SKAlphaType.Premul);
+                        displayBitmap = bitmap.Resize(resizeInfo, SKFilterQuality.Medium);
                     }
-                }
-                else if (bitmap.ColorType != SKColorType.Bgra8888)
-                {
-                    // Convert to Bgra8888 if needed
-                    Log($"Converting from {bitmap.ColorType} to Bgra8888...");
-                    displayBitmap = new SKBitmap(bitmap.Width, bitmap.Height, SKColorType.Bgra8888, SKAlphaType.Premul);
-                    using (var canvas = new SKCanvas(displayBitmap))
+                    else if (bitmap.ColorType != SKColorType.Bgra8888)
                     {
+                        displayBitmap = new SKBitmap(bitmap.Width, bitmap.Height, SKColorType.Bgra8888, SKAlphaType.Premul);
+                        using var canvas = new SKCanvas(displayBitmap);
                         canvas.DrawBitmap(bitmap, 0, 0);
                     }
-                }
 
-                Log($"Display bitmap: {displayBitmap.Width}x{displayBitmap.Height}, ColorType: {displayBitmap.ColorType}");
+                    using var fs = File.OpenWrite(tempPath);
+                    displayBitmap.Encode(fs, SKEncodedImageFormat.Jpeg, 85);
 
-                // Save to temp file using JPEG (faster, smaller)
-                string cacheDir = FileSystem.CacheDirectory;
-                string tempPath = Path.Combine(cacheDir, $"source_{DateTime.Now.Ticks}.jpg");
-                Log($"TempPath: {tempPath}");
-
-                using (var fileStream = File.OpenWrite(tempPath))
-                {
-                    Log("Encoding to JPEG...");
-                    bool encoded = displayBitmap.Encode(fileStream, SKEncodedImageFormat.Jpeg, 85);
-                    Log($"Encode result: {encoded}");
-
-                    if (!encoded)
-                    {
-                        Log("ERROR: Failed to encode bitmap");
-                        MyLabel.Text = "Error: Failed to encode bitmap";
-                        return;
-                    }
-                }
-
-                // Dispose display bitmap if we created one
-                if (displayBitmap != bitmap)
-                {
-                    displayBitmap.Dispose();
-                }
-
-                // Verify file was created
-                if (File.Exists(tempPath))
-                {
-                    var fileInfo = new FileInfo(tempPath);
-                    Log($"File created: {tempPath}, Size: {fileInfo.Length / 1024} KB");
-                }
-
-                // Set on UI thread using FileImageSource
-                Log("Setting ImageSource on UI thread...");
-                await MainThread.InvokeOnMainThreadAsync(() =>
-                {
-                    var imgSource = ImageSource.FromFile(tempPath);
-                    sourceImage.Source = imgSource;
-                    lblStatus.Text = "Status: Image loaded - Ready to analyze";
+                    if (displayBitmap != bitmap)
+                        displayBitmap.Dispose();
                 });
 
-                // Auto-fit: set image to fit within display area
+                // Single UI update
                 await MainThread.InvokeOnMainThreadAsync(() =>
                 {
-                    // Reset to auto-size (AspectFit will handle fitting)
+                    sourceImage.Source = ImageSource.FromFile(tempPath);
                     sourceImage.WidthRequest = -1;
                     sourceImage.HeightRequest = -1;
                     _currentZoom = 1.0;
                     lblZoom.Text = "Fit";
+                    lblStatus.Text = "Status: Image loaded - Ready to analyze";
                 });
 
                 MyLabel.Text = $"Loaded: {bitmap.Width}x{bitmap.Height}" + (needsResize ? " (縮圖顯示)" : "");
@@ -522,7 +469,7 @@ namespace CameraMaui.Pages
         /// </summary>
         private async void OnAnalyzeClicked(object sender, EventArgs e)
         {
-            if (_currentEmguImage == null)
+            if (_currentImage == null)
             {
                 await DisplayAlert("No Image", "Please capture or select an image first.", "OK");
                 return;
@@ -533,6 +480,17 @@ namespace CameraMaui.Pages
                 lblStatus.Text = "Status: Analyzing...";
                 btnAnalyze.IsEnabled = false;
                 Log("=== OnAnalyzeClicked START ===");
+
+                // Lazy Emgu conversion - only convert when analysis is needed
+                if (_currentEmguImage == null)
+                {
+                    Log("Lazy Emgu conversion...");
+                    await Task.Run(() =>
+                    {
+                        _currentEmguImage = ConvertSKBitmapToEmguImage(_currentImage);
+                    });
+                    Log($"Emgu ready: {_currentEmguImage.Width}x{_currentEmguImage.Height}");
+                }
 
                 List<RingCodeDecoder.RingCodeResult> allResults = null;
                 RingImageSegmentation.SegmentationResult segmentResult = null;
@@ -820,8 +778,9 @@ namespace CameraMaui.Pages
                 _currentImage = CreateSampleRingCodeImage();
                 Log($"Sample created: {_currentImage?.Width}x{_currentImage?.Height}, ColorType: {_currentImage?.ColorType}");
 
-                _currentEmguImage = ConvertSKBitmapToEmguImage(_currentImage);
-                Log($"Converted to Emgu: {_currentEmguImage?.Width}x{_currentEmguImage?.Height}");
+                // Emgu conversion deferred to OnAnalyzeClicked (lazy)
+                _currentEmguImage?.Dispose();
+                _currentEmguImage = null;
 
                 await SetSourceImage(_currentImage);
                 lblStatus.Text = "Status: Sample generated - Ready to analyze";

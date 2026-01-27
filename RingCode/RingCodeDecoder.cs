@@ -44,6 +44,10 @@ namespace CameraMaui.RingCode
         private ArrowTemplateMatcher _lightTemplateMatcher;
         private bool _templatesInitialized = false;
 
+        // Cached GRAYSCALE templates (not binarized, for direct grayscale matching)
+        private static Image<Gray, byte> _grayTemplateDark = null;
+        private static Image<Gray, byte> _grayTemplateLight = null;
+
 #if WINDOWS
         // Shape-based matcher (higher accuracy, Windows only)
         private IShapeBasedMatcher? _shapeMatcher;
@@ -88,6 +92,18 @@ namespace CameraMaui.RingCode
             if (_cachedDarkTemplatePath == null && _cachedLightTemplatePath == null)
             {
                 Log($"[Template] WARNING: No templates found!");
+            }
+
+            // Load GRAYSCALE templates (not binarized) for direct grayscale matching
+            if (_grayTemplateDark == null && _cachedDarkTemplatePath != null && File.Exists(_cachedDarkTemplatePath))
+            {
+                _grayTemplateDark = new Image<Gray, byte>(_cachedDarkTemplatePath);
+                Log($"[Template] Gray dark loaded: {_grayTemplateDark.Width}x{_grayTemplateDark.Height}");
+            }
+            if (_grayTemplateLight == null && _cachedLightTemplatePath != null && File.Exists(_cachedLightTemplatePath))
+            {
+                _grayTemplateLight = new Image<Gray, byte>(_cachedLightTemplatePath);
+                Log($"[Template] Gray light loaded: {_grayTemplateLight.Width}x{_grayTemplateLight.Height}");
             }
 
             _templatesInitialized = true;
@@ -810,9 +826,10 @@ namespace CameraMaui.RingCode
                 maskedForNlMeans.SetValue(new MCvScalar(ringMean));
                 ringImage.Copy(maskedForNlMeans, ringMask);
 
-                // Apply Non-local Means denoising (h=25 for strong noise reduction)
+                // Apply Non-local Means denoising (h=25 for both ring types)
+                float nlMeansH = 25f;
                 var denoised = new Image<Gray, byte>(maskedForNlMeans.Size);
-                CvInvoke.FastNlMeansDenoising(maskedForNlMeans, denoised, h: 25, templateWindowSize: 7, searchWindowSize: 21);
+                CvInvoke.FastNlMeansDenoising(maskedForNlMeans, denoised, h: nlMeansH, templateWindowSize: 7, searchWindowSize: 21);
                 maskedForNlMeans.Dispose();
 
                 // Apply Otsu threshold to denoised image
@@ -1888,7 +1905,7 @@ namespace CameraMaui.RingCode
             }
 #endif
 
-            // Method 0 (BACKUP): Multi-angle Rotated Template Matching
+            // Method 0 (BACKUP): Multi-angle Rotated Template Matching on binary foreground
             // 對 24 個旋轉角度的 Y-arrow template 做 matchTemplate，找到最高分數
             Log($"  [Method 0] Multi-angle Rotated Template Matching...");
             var rotatedResult = FindArrowByRotatedTemplateMatch(foreground, region);
@@ -2285,6 +2302,151 @@ namespace CameraMaui.RingCode
                 Log($"  [Skeleton] Error: {ex.Message}");
                 return null;
             }
+        }
+
+        /// <summary>
+        /// Find Y-arrow using grayscale template matching on the ORIGINAL grayscale image.
+        /// Bypasses binary preprocessing which can fail for some images.
+        /// Uses CcoeffNormed for brightness-invariant matching.
+        /// </summary>
+        private (bool found, double angle, double score, PointF matchCenter) FindArrowByGrayscaleMatch(
+            Image<Gray, byte> grayImage, RingImageSegmentation.RingRegion region)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+
+            // Select template based on ring type
+            var template = _lastRingIsLight ? _grayTemplateLight : _grayTemplateDark;
+            if (template == null)
+            {
+                Log($"    [GrayMatch] No grayscale template for {(_lastRingIsLight ? "LIGHT" : "DARK")} ring");
+                return (false, 0, 0, PointF.Empty);
+            }
+
+            float ringCx = region.Center.X;
+            float ringCy = region.Center.Y;
+            float outerR = region.OuterRadius;
+            float innerR = region.InnerRadius;
+
+            // Extract ROI around ring
+            int margin = 20;
+            int roiX = Math.Max(0, (int)(ringCx - outerR - margin));
+            int roiY = Math.Max(0, (int)(ringCy - outerR - margin));
+            int roiW = Math.Min((int)(outerR * 2 + margin * 2), grayImage.Width - roiX);
+            int roiH = Math.Min((int)(outerR * 2 + margin * 2), grayImage.Height - roiY);
+
+            if (roiW < template.Width || roiH < template.Height)
+                return (false, 0, 0, PointF.Empty);
+
+            // Extract grayscale ROI
+            grayImage.ROI = new Rectangle(roiX, roiY, roiW, roiH);
+            var searchRegion = grayImage.Clone();
+            grayImage.ROI = Rectangle.Empty;
+
+            // Ring mask: only search in ring area (0.55R - 0.95R)
+            float localCx = ringCx - roiX;
+            float localCy = ringCy - roiY;
+            var ringMask = new Image<Gray, byte>(searchRegion.Size);
+            ringMask.SetZero();
+            CvInvoke.Circle(ringMask, new Point((int)localCx, (int)localCy), (int)(outerR * 0.95f), new MCvScalar(255), -1);
+            CvInvoke.Circle(ringMask, new Point((int)localCx, (int)localCy), (int)(outerR * 0.55f), new MCvScalar(0), -1);
+
+            // Calculate expected arrow size and scale factors
+            float expectedArrowSize = (outerR - innerR) * 0.8f;
+            float baseSize = Math.Max(template.Width, template.Height);
+            float baseScale = expectedArrowSize / baseSize;
+            float[] scales = { baseScale * 0.8f, baseScale, baseScale * 1.2f };
+
+            double bestScore = 0;
+            int bestAngle = 0;
+            Point bestLocation = Point.Empty;
+            float bestScaleUsed = 1;
+            int bestTemplateW = 0, bestTemplateH = 0;
+
+            foreach (float scale in scales)
+            {
+                int scaledW = Math.Max(8, (int)(template.Width * scale));
+                int scaledH = Math.Max(8, (int)(template.Height * scale));
+
+                if (scaledW >= searchRegion.Width - 2 || scaledH >= searchRegion.Height - 2)
+                    continue;
+
+                using var scaledTemplate = new Image<Gray, byte>(scaledW, scaledH);
+                CvInvoke.Resize(template, scaledTemplate, new System.Drawing.Size(scaledW, scaledH));
+
+                // Resize ring mask to match result dimensions for this template size
+                int resultW = searchRegion.Width - scaledW + 1;
+                int resultH = searchRegion.Height - scaledH + 1;
+                using var maskResized = new Image<Gray, byte>(resultW, resultH);
+                CvInvoke.Resize(ringMask, maskResized, new System.Drawing.Size(resultW, resultH));
+
+                for (int a = 0; a < 360; a += 15)
+                {
+                    // Rotate template
+                    using var rotMat = new Mat();
+                    CvInvoke.GetRotationMatrix2D(new PointF(scaledW / 2f, scaledH / 2f), -a, 1.0, rotMat);
+
+                    using var rotatedTemplate = new Image<Gray, byte>(scaledTemplate.Size);
+                    CvInvoke.WarpAffine(scaledTemplate, rotatedTemplate, rotMat, scaledTemplate.Size,
+                        Inter.Linear, Warp.Default, BorderType.Constant, new MCvScalar(128));
+
+                    // Match with CcoeffNormed (brightness-invariant)
+                    using var result = new Mat();
+                    CvInvoke.MatchTemplate(searchRegion, rotatedTemplate, result, TemplateMatchingType.CcoeffNormed);
+
+                    // Apply ring mask
+                    using var resultImg = result.ToImage<Gray, float>();
+                    for (int py = 0; py < resultH; py++)
+                        for (int px = 0; px < resultW; px++)
+                            if (maskResized.Data[py, px, 0] == 0)
+                                resultImg.Data[py, px, 0] = 0;
+
+                    double minVal = 0, maxVal = 0;
+                    Point minLoc = new Point(), maxLoc = new Point();
+                    CvInvoke.MinMaxLoc(resultImg, ref minVal, ref maxVal, ref minLoc, ref maxLoc);
+
+                    if (maxVal > bestScore)
+                    {
+                        bestScore = maxVal;
+                        bestAngle = a;
+                        bestLocation = maxLoc;
+                        bestScaleUsed = scale;
+                        bestTemplateW = scaledW;
+                        bestTemplateH = scaledH;
+                    }
+                }
+            }
+
+            ringMask.Dispose();
+            searchRegion.Dispose();
+
+            if (bestScore < 0.3)
+            {
+                Log($"    [GrayMatch] No good match, bestScore={bestScore:F3}, time={sw.ElapsedMilliseconds}ms");
+                return (false, 0, bestScore, PointF.Empty);
+            }
+
+            // Calculate match center in original image coordinates
+            float matchCenterX = roiX + bestLocation.X + bestTemplateW / 2f;
+            float matchCenterY = roiY + bestLocation.Y + bestTemplateH / 2f;
+
+            // Arrow direction = angle from ring center to match position
+            double angleFromCenter = Math.Atan2(matchCenterY - ringCy, matchCenterX - ringCx) * 180.0 / Math.PI;
+            if (angleFromCenter < 0) angleFromCenter += 360;
+
+            double distFromCenter = Math.Sqrt(Math.Pow(matchCenterX - ringCx, 2) + Math.Pow(matchCenterY - ringCy, 2));
+            double distRatio = distFromCenter / outerR;
+
+            Log($"    [GrayMatch] Best: angle={bestAngle}°, score={bestScore:F3}, scale={bestScaleUsed:F2}, " +
+                $"center=({matchCenterX:F0},{matchCenterY:F0}), angleFromCenter={angleFromCenter:F1}°, " +
+                $"distRatio={distRatio:F2}, time={sw.ElapsedMilliseconds}ms");
+
+            if (distRatio < 0.5 || distRatio > 1.1)
+            {
+                Log($"    [GrayMatch] Match position outside ring area (distRatio={distRatio:F2})");
+                return (false, 0, bestScore, PointF.Empty);
+            }
+
+            return (true, angleFromCenter, bestScore, new PointF(matchCenterX, matchCenterY));
         }
 
         /// <summary>
@@ -5015,9 +5177,19 @@ namespace CameraMaui.RingCode
                 float scaledOuterR = region.OuterRadius * scale;
                 float scaledInnerR = region.InnerRadius * scale;
 
-                // Fit outer circle from GRAYSCALE edges (not binary foreground)
+                // Fit outer circle:
+                // - Dark ring: use GRAYSCALE edges (ring boundary is clear in gray)
+                // - Light ring: use FOREGROUND MASK edges (binary boundary is cleaner for light rings)
                 using var edges = new Image<Gray, byte>(outputSize, outputSize);
-                CvInvoke.Canny(scaledGray, edges, 50, 150);
+                if (_lastRingIsLight)
+                {
+                    CvInvoke.Canny(scaled, edges, 50, 150);
+                    Log($"  [RotatedDecode] Using FOREGROUND MASK edges for outer circle (light ring)");
+                }
+                else
+                {
+                    CvInvoke.Canny(scaledGray, edges, 50, 150);
+                }
 
                 using var ringMask = new Image<Gray, byte>(outputSize, outputSize);
                 ringMask.SetValue(new MCvScalar(0));
@@ -5046,7 +5218,18 @@ namespace CameraMaui.RingCode
                     }
                 }
 
-                // Also fit inner circle from edges (like visualization code does)
+                // Also fit inner circle from GRAYSCALE edges (dark hole boundary)
+                // For light rings, use separate Canny on gray since outer used foreground mask
+                using var innerEdgesSource = new Image<Gray, byte>(outputSize, outputSize);
+                if (_lastRingIsLight)
+                {
+                    CvInvoke.Canny(scaledGray, innerEdgesSource, 30, 100);
+                }
+                else
+                {
+                    edges.CopyTo(innerEdgesSource);  // Reuse gray edges for dark rings
+                }
+
                 using var innerRingMask = new Image<Gray, byte>(outputSize, outputSize);
                 innerRingMask.SetValue(new MCvScalar(0));
                 float expectedInnerR = scaledOuterR * region.InnerRadius / region.OuterRadius;
@@ -5054,7 +5237,7 @@ namespace CameraMaui.RingCode
                 CvInvoke.Circle(innerRingMask, new Point(newCx, newCy), Math.Max(0, (int)expectedInnerR - 15), new MCvScalar(0), -1);
 
                 using var innerMaskedEdges = new Image<Gray, byte>(outputSize, outputSize);
-                CvInvoke.BitwiseAnd(edges, innerRingMask, innerMaskedEdges);
+                CvInvoke.BitwiseAnd(innerEdgesSource, innerRingMask, innerMaskedEdges);
 
                 var innerEdgePoints = new List<Point>();
                 byte[,,] innerEdgeData = innerMaskedEdges.Data;
@@ -5829,13 +6012,13 @@ namespace CameraMaui.RingCode
                     var (rotatedDecoded, parityValid, bccValid) = DecryptBinaryWithValidation(rotatedBinaryString);
                     Log($"  [Rotated] Re-decoded: {rotatedDecoded}, parity={parityValid}, BCC={bccValid}");
 
-                    // Update result if rotated decode is better
-                    if (rotatedDecoded != "-1" && !result.IsValid)
+                    // Always update result with rotated decode (uses LeastSquares-fitted circles for better accuracy)
+                    if (rotatedDecoded != "-1")
                     {
+                        Log($"  [Rotated] {(result.IsValid ? "OVERRIDE" : "FALLBACK")}: {rotatedDecoded} (was: {result.DecodedData})");
                         result.BinaryString = rotatedBinaryString;
                         result.DecodedData = rotatedDecoded;
                         result.IsValid = true;
-                        Log($"  [Rotated] Updated result with rotated decode!");
                     }
                 }
 

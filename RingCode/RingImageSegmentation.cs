@@ -283,9 +283,8 @@ namespace CameraMaui.RingCode
             return regions;
         }
 
-        // Debug output path
-        private static readonly string DebugOutputPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "RingDebug");
+        // Debug output path - set to null to disable debug image saving (production)
+        public static string DebugOutputPath = null;
 
         /// <summary>
         /// Detect single large ring using contour hierarchy to find ring-shaped regions
@@ -297,8 +296,9 @@ namespace CameraMaui.RingCode
         {
             try
             {
-                // Create debug output directory
-                if (!Directory.Exists(DebugOutputPath))
+                // Create debug output directory (only if debug enabled)
+                bool saveDebug = DebugOutputPath != null;
+                if (saveDebug && !Directory.Exists(DebugOutputPath))
                     Directory.CreateDirectory(DebugOutputPath);
 
                 int imgWidth = original.Width;
@@ -310,7 +310,7 @@ namespace CameraMaui.RingCode
                 debugLog.AppendLine($"Image size: {imgWidth}x{imgHeight}, minDim: {minDim}");
 
                 // Save original for debug
-                original.Save(Path.Combine(DebugOutputPath, "01_original.png"));
+                if (saveDebug) original.Save(Path.Combine(DebugOutputPath, "01_original.png"));
 
                 // ============ Simple Otsu + Blob Analysis ============
                 // Step 1: Gaussian blur to reduce noise
@@ -320,7 +320,7 @@ namespace CameraMaui.RingCode
                 // Step 2: Otsu threshold - simple and robust
                 var binary = new Image<Gray, byte>(original.Size);
                 double otsuThresh = CvInvoke.Threshold(blurred, binary, 0, 255, ThresholdType.Otsu | ThresholdType.Binary);
-                binary.Save(Path.Combine(DebugOutputPath, "02_otsu.png"));
+                if (saveDebug) binary.Save(Path.Combine(DebugOutputPath, "02_otsu.png"));
 
                 MCvScalar mean = CvInvoke.Mean(original);
                 double meanGray = mean.V0;
@@ -341,13 +341,13 @@ namespace CameraMaui.RingCode
                 var filledRing = new Image<Gray, byte>(original.Size);
                 CvInvoke.BitwiseNot(filled, filledRing);
                 CvInvoke.BitwiseOr(filledRing, binary, filledRing); // Combine with original binary
-                filledRing.Save(Path.Combine(DebugOutputPath, "03_filled.png"));
+                if (saveDebug) filledRing.Save(Path.Combine(DebugOutputPath, "03_filled.png"));
                 debugLog.AppendLine($"Fill holes completed");
 
                 // Step 4: Use filled mask to extract ring region from original
                 var maskedOriginal = new Image<Gray, byte>(original.Size);
                 CvInvoke.BitwiseAnd(original, filledRing, maskedOriginal);
-                maskedOriginal.Save(Path.Combine(DebugOutputPath, "04_masked_original.png"));
+                if (saveDebug) maskedOriginal.Save(Path.Combine(DebugOutputPath, "04_masked_original.png"));
 
                 // Step 5: Otsu on masked region to get black areas (data marks)
                 // Only process pixels inside the ring mask
@@ -355,7 +355,7 @@ namespace CameraMaui.RingCode
                 double otsuThresh2 = CvInvoke.Threshold(maskedOriginal, ringRegionBinary, 0, 255, ThresholdType.Otsu | ThresholdType.BinaryInv);
                 // Keep only pixels inside the ring mask
                 CvInvoke.BitwiseAnd(ringRegionBinary, filledRing, ringRegionBinary);
-                ringRegionBinary.Save(Path.Combine(DebugOutputPath, "05_ring_binary.png"));
+                if (saveDebug) ringRegionBinary.Save(Path.Combine(DebugOutputPath, "05_ring_binary.png"));
                 debugLog.AppendLine($"Ring region Otsu threshold: {otsuThresh2:F1}");
 
                 // Save a clean copy of filledRing BEFORE morphological operations (for contour fitting later)
@@ -455,14 +455,14 @@ namespace CameraMaui.RingCode
                         5, new MCvScalar(0, 255, 255), -1);
                 }
 
-                blobDebug.Save(Path.Combine(DebugOutputPath, "06_blob_analysis.png"));
-                filledRing.Save(Path.Combine(DebugOutputPath, "06_filled_cleaned.png"));
+                if (saveDebug) blobDebug.Save(Path.Combine(DebugOutputPath, "06_blob_analysis.png"));
+                if (saveDebug) filledRing.Save(Path.Combine(DebugOutputPath, "06_filled_cleaned.png"));
 
                 // Check if blob analysis found a valid ring
                 if (bestLabel < 0 || bestRadius < minDim * 0.05f)
                 {
                     debugLog.AppendLine("\nNo valid ring blob found!");
-                    File.WriteAllText(Path.Combine(DebugOutputPath, "debug_log.txt"), debugLog.ToString());
+                    if (saveDebug) File.WriteAllText(Path.Combine(DebugOutputPath, "debug_log.txt"), debugLog.ToString());
                     Log("No ring blob found");
                     return null;
                 }
@@ -479,7 +479,7 @@ namespace CameraMaui.RingCode
                 debugLog.AppendLine("=== Data Ring Circle Fitting ===");
 
                 // Save filledRingClean for debugging
-                filledRingClean.Save(Path.Combine(DebugOutputPath, "03b_filled_clean.png"));
+                if (saveDebug) filledRingClean.Save(Path.Combine(DebugOutputPath, "03b_filled_clean.png"));
 
                 // Step 8a: Radial scan on ringRegionBinary to find outermost DATA points
                 // Strategy: scan from CENTER outward, find MAX radius where white pixel exists
@@ -656,43 +656,30 @@ namespace CameraMaui.RingCode
                 debugLog.AppendLine($"Final: outerR={bestOuterRadius:F1}, innerR={bestInnerRadius:F1}");
 
                 // Save debug log now
-                File.WriteAllText(Path.Combine(DebugOutputPath, "debug_log.txt"), debugLog.ToString());
+                if (saveDebug) File.WriteAllText(Path.Combine(DebugOutputPath, "debug_log.txt"), debugLog.ToString());
 
-                // Save final result visualization: ringRegionBinary (blob) + circles + edge points
-                try
+                // Save final result visualization (only if debug enabled)
+                if (saveDebug)
                 {
-                    var finalDebug = ringRegionBinary.Convert<Bgr, byte>();
-
-                    // Draw inner edge points (cyan small circles)
-                    foreach (var pt in _lastInnerEdgePoints)
+                    try
                     {
-                        CvInvoke.Circle(finalDebug, new Point((int)pt.X, (int)pt.Y), 3, new MCvScalar(255, 255, 0), -1);
+                        var finalDebug = ringRegionBinary.Convert<Bgr, byte>();
+                        foreach (var pt in _lastInnerEdgePoints)
+                            CvInvoke.Circle(finalDebug, new Point((int)pt.X, (int)pt.Y), 3, new MCvScalar(255, 255, 0), -1);
+                        foreach (var pt in _lastOuterEdgePoints)
+                            CvInvoke.Circle(finalDebug, new Point((int)pt.X, (int)pt.Y), 3, new MCvScalar(255, 0, 255), -1);
+                        CvInvoke.Circle(finalDebug, new Point((int)bestCenter.X, (int)bestCenter.Y),
+                            (int)metroInnerR, new MCvScalar(255, 255, 0), 2);
+                        CvInvoke.Circle(finalDebug, new Point((int)bestCenter.X, (int)bestCenter.Y),
+                            (int)metroOuterR, new MCvScalar(255, 0, 255), 2);
+                        CvInvoke.Circle(finalDebug, new Point((int)bestCenter.X, (int)bestCenter.Y),
+                            5, new MCvScalar(0, 255, 0), -1);
+                        finalDebug.Save(Path.Combine(DebugOutputPath, "08_final_circles.png"));
                     }
-
-                    // Draw outer edge points (magenta small circles)
-                    foreach (var pt in _lastOuterEdgePoints)
+                    catch (Exception ex)
                     {
-                        CvInvoke.Circle(finalDebug, new Point((int)pt.X, (int)pt.Y), 3, new MCvScalar(255, 0, 255), -1);
+                        Log($"Final debug save failed: {ex.Message}");
                     }
-
-                    // Draw inner circle (cyan)
-                    CvInvoke.Circle(finalDebug, new Point((int)bestCenter.X, (int)bestCenter.Y),
-                        (int)metroInnerR, new MCvScalar(255, 255, 0), 2);
-
-                    // Draw outer circle (magenta)
-                    CvInvoke.Circle(finalDebug, new Point((int)bestCenter.X, (int)bestCenter.Y),
-                        (int)metroOuterR, new MCvScalar(255, 0, 255), 2);
-
-                    // Draw center point (green)
-                    CvInvoke.Circle(finalDebug, new Point((int)bestCenter.X, (int)bestCenter.Y),
-                        5, new MCvScalar(0, 255, 0), -1);
-
-                    finalDebug.Save(Path.Combine(DebugOutputPath, "08_final_circles.png"));
-                    Log($"Final debug saved: 08_final_circles.png, outer={_lastOuterEdgePoints.Count}, inner={_lastInnerEdgePoints.Count}");
-                }
-                catch (Exception ex)
-                {
-                    Log($"Final debug save failed: {ex.Message}");
                 }
 
                 Log($"Final ring: innerR={bestInnerRadius:F0}, outerR={bestOuterRadius:F0}");
@@ -1877,47 +1864,31 @@ namespace CameraMaui.RingCode
                 Log($"  Metrology: final center=({a:F1},{b:F1}), r={fittedR:F1}, " +
                     $"centerDist={centerDist:F1}, radiusDiff={radiusDiff:F1}, points={currentPoints.Count}");
 
-                // Save debug visualization
-                try
+                // Save debug visualization (only if debug enabled)
+                if (DebugOutputPath != null)
                 {
-                    var debugImg = source.Convert<Bgr, byte>();
-
-                    // Draw all original edge points as yellow (small)
-                    foreach (var pt in edgePoints)
+                    try
                     {
-                        CvInvoke.Circle(debugImg, new Point((int)pt.X, (int)pt.Y), 2, new MCvScalar(0, 255, 255), -1);
+                        var debugImg = source.Convert<Bgr, byte>();
+                        foreach (var pt in edgePoints)
+                            CvInvoke.Circle(debugImg, new Point((int)pt.X, (int)pt.Y), 2, new MCvScalar(0, 255, 255), -1);
+                        var outliers = edgePoints.Where(p => !currentPoints.Any(c =>
+                            Math.Abs(c.X - p.X) < 1 && Math.Abs(c.Y - p.Y) < 1)).ToList();
+                        foreach (var pt in outliers)
+                            CvInvoke.Circle(debugImg, new Point((int)pt.X, (int)pt.Y), 5, new MCvScalar(0, 0, 255), -1);
+                        foreach (var pt in currentPoints)
+                            CvInvoke.Circle(debugImg, new Point((int)pt.X, (int)pt.Y), 4, new MCvScalar(0, 255, 0), -1);
+                        CvInvoke.Circle(debugImg, new Point((int)a, (int)b), (int)fittedR, new MCvScalar(255, 0, 255), 2);
+                        CvInvoke.Circle(debugImg, new Point((int)a, (int)b), 5, new MCvScalar(255, 0, 255), -1);
+                        CvInvoke.Circle(debugImg, new Point((int)roughCenter.X, (int)roughCenter.Y),
+                            (int)roughRadius, new MCvScalar(255, 255, 0), 1);
+                        string suffix = isOuterEdge ? "outer" : "inner";
+                        debugImg.Save(Path.Combine(DebugOutputPath, $"07_metrology_{suffix}.png"));
                     }
-
-                    // Draw outliers (removed points) as red
-                    var outliers = edgePoints.Where(p => !currentPoints.Any(c =>
-                        Math.Abs(c.X - p.X) < 1 && Math.Abs(c.Y - p.Y) < 1)).ToList();
-                    foreach (var pt in outliers)
+                    catch (Exception debugEx)
                     {
-                        CvInvoke.Circle(debugImg, new Point((int)pt.X, (int)pt.Y), 5, new MCvScalar(0, 0, 255), -1);
+                        Log($"  Metrology debug save failed: {debugEx.Message}");
                     }
-
-                    // Draw inliers (used points) as green
-                    foreach (var pt in currentPoints)
-                    {
-                        CvInvoke.Circle(debugImg, new Point((int)pt.X, (int)pt.Y), 4, new MCvScalar(0, 255, 0), -1);
-                    }
-
-                    // Draw final fitted circle in magenta
-                    CvInvoke.Circle(debugImg, new Point((int)a, (int)b), (int)fittedR, new MCvScalar(255, 0, 255), 2);
-                    // Draw center
-                    CvInvoke.Circle(debugImg, new Point((int)a, (int)b), 5, new MCvScalar(255, 0, 255), -1);
-
-                    // Draw rough circle in cyan for comparison
-                    CvInvoke.Circle(debugImg, new Point((int)roughCenter.X, (int)roughCenter.Y),
-                        (int)roughRadius, new MCvScalar(255, 255, 0), 1);
-
-                    string suffix = isOuterEdge ? "outer" : "inner";
-                    debugImg.Save(Path.Combine(DebugOutputPath, $"07_metrology_{suffix}.png"));
-                    Log($"  Metrology debug saved: 07_metrology_{suffix}.png");
-                }
-                catch (Exception debugEx)
-                {
-                    Log($"  Metrology debug save failed: {debugEx.Message}");
                 }
 
                 // Accept if reasonable (center within 30% of radius, radius within 50%)
